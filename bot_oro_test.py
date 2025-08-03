@@ -15,7 +15,7 @@ TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER")
 DESTINATION_NUMBER = os.getenv("DESTINATION_NUMBER")
-GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS")  # JSON delle credenziali
+GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS")
 SPREADSHEET_NAME = "BOT ORO – TEST"
 
 # === GOOGLE SHEETS ===
@@ -51,7 +51,7 @@ def update_summary(total_trades, wins, losses, profit_pct, projection):
     sheet_summary.update("A2", [[total_trades,wins,losses,profit_pct,projection]])
 
 def get_price():
-    ticker = binance_client.get_symbol_ticker(symbol="XAUUSDT")
+    ticker = binance_client.get_symbol_ticker(symbol="PAXGUSDT")
     return float(ticker['price'])
 
 def simulate_trade():
@@ -71,7 +71,7 @@ def run_session(duration_hours):
     wins = 0
     losses = 0
     profit_total = 0.0
-    send_whatsapp(f"🚀 Inizio sessione BOT ORO - Durata: {duration_hours}h")
+    send_whatsapp(f"🚀 Inizio sessione BOT ORO - Durata: {duration_hours}h | Prezzo attuale PAXG: {get_price()} USDT")
     while datetime.now() < end_time:
         if trades < MAX_POSITIONS:
             price_entry, sl, tp1, tp2, exit_price, outcome, profit_pct = simulate_trade()
