@@ -41,9 +41,7 @@ def log_trade():
     price = get_price()
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     sheet_operations.append_row([now, "TEST", price, "", "", "", price, "OK", "0.0", "Operazione di test"])
-    send_whatsapp(f"📈 Bot ORO attivo!
-Prezzo PAXGUSDT: {price} USD
-Operazione registrata.")
+    send_whatsapp(f"📈 Bot ORO attivo! Prezzo PAXGUSDT: {price} USD - Operazione registrata.")
 
 # === AVVIO ===
 send_whatsapp("🚀 Bot ORO avviato con successo! Inizio test di 1 ora.")
