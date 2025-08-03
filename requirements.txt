@@ -1,3 +1,6 @@
+
 gspread
 twilio
 python-binance
+google-auth
+google-auth-oauthlib

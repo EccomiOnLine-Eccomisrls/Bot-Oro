@@ -1,14 +1,11 @@
 
-import os
-import json
 import time
 import gspread
 from twilio.rest import Client
-from datetime import datetime, timedelta
+from datetime import datetime
 from binance.client import Client as BinanceClient
-import random
-
-print("=== Avvio BOT in modalità DEBUG ===")
+import json
+import os
 
 # === CONFIG ===
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
@@ -20,34 +17,37 @@ DESTINATION_NUMBER = os.getenv("DESTINATION_NUMBER")
 GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS")
 SPREADSHEET_NAME = "BOT ORO – TEST"
 
-# === GOOGLE SHEETS ===
-try:
-    creds = json.loads(GOOGLE_CREDENTIALS)
-    gc = gspread.service_account_from_dict(creds)
-    sh = gc.open(SPREADSHEET_NAME)
-    sheet_operations = sh.sheet1
-    try:
-        sheet_summary = sh.worksheet("Riepilogo")
-    except:
-        sheet_summary = sh.add_worksheet(title="Riepilogo", rows=20, cols=5)
-    print("✅ Connessione a Google Sheets riuscita.")
-    sheet_operations.append_row([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "DEBUG", "BOT AVVIATO"])
-except Exception as e:
-    print("❌ Errore connessione Google Sheets:", e)
+# === CONNESSIONI ===
+binance_client = BinanceClient(BINANCE_API_KEY, BINANCE_API_SECRET)
+twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+creds = json.loads(GOOGLE_CREDENTIALS)
+gc = gspread.service_account_from_dict(creds)
+sh = gc.open(SPREADSHEET_NAME)
+sheet_operations = sh.sheet1
 
-# === BINANCE + TWILIO ===
-try:
-    binance_client = BinanceClient(BINANCE_API_KEY, BINANCE_API_SECRET)
-    prezzo_test = binance_client.get_symbol_ticker(symbol="PAXGUSDT")
-    print("✅ Connessione a Binance riuscita. Prezzo PAXG:", prezzo_test)
-except Exception as e:
-    print("❌ Errore connessione Binance:", e)
+# === FUNZIONI ===
+def send_whatsapp(message):
+    twilio_client.messages.create(
+        body=message,
+        from_=TWILIO_WHATSAPP_NUMBER,
+        to=DESTINATION_NUMBER
+    )
 
-try:
-    twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-    twilio_client.messages.create(from_=TWILIO_WHATSAPP_NUMBER, body="BOT AVVIATO IN DEBUG - Connessione OK", to=DESTINATION_NUMBER)
-    print("✅ Messaggio di test WhatsApp inviato.")
-except Exception as e:
-    print("❌ Errore invio WhatsApp:", e)
+def get_price():
+    data = binance_client.get_symbol_ticker(symbol="PAXGUSDT")
+    return float(data['price'])
 
-print("=== Fine fase di test DEBUG. Se vedi tutti i ✅, il bot è pronto a funzionare. ===")
+def log_trade():
+    price = get_price()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    sheet_operations.append_row([now, "TEST", price, "", "", "", price, "OK", "0.0", "Operazione di test"])
+    send_whatsapp(f"📈 Bot ORO attivo!
+Prezzo PAXGUSDT: {price} USD
+Operazione registrata.")
+
+# === AVVIO ===
+send_whatsapp("🚀 Bot ORO avviato con successo! Inizio test di 1 ora.")
+for i in range(2):
+    log_trade()
+    time.sleep(30)  # ogni 30 secondi per test veloce
+send_whatsapp("✅ Test completato. Bot ORO operativo.")
