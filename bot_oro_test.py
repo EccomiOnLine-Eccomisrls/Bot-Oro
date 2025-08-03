@@ -1,5 +1,6 @@
 
 import os
+import json
 import time
 import gspread
 from twilio.rest import Client
@@ -14,26 +15,30 @@ TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER")
 DESTINATION_NUMBER = os.getenv("DESTINATION_NUMBER")
-SERVICE_ACCOUNT_FILE = "bot-oro-4807603afb6b.json"
+GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS")  # JSON delle credenziali
 SPREADSHEET_NAME = "BOT ORO – TEST"
 
-TRADE_SIZE = 1.0
-STOP_LOSS = -0.5/100
-TAKE_PROFIT1 = 1/100
-TAKE_PROFIT2 = 2/100
-MAX_POSITIONS = 5
-LOSS_ALERT_THRESHOLD = -3.0
-
-# === CONNESSIONI ===
-binance_client = BinanceClient(BINANCE_API_KEY, BINANCE_API_SECRET)
-twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-gc = gspread.service_account(filename=SERVICE_ACCOUNT_FILE)
+# === GOOGLE SHEETS ===
+creds = json.loads(GOOGLE_CREDENTIALS)
+gc = gspread.service_account_from_dict(creds)
 sh = gc.open(SPREADSHEET_NAME)
 sheet_operations = sh.sheet1
 try:
     sheet_summary = sh.worksheet("Riepilogo")
 except:
     sheet_summary = sh.add_worksheet(title="Riepilogo", rows=20, cols=5)
+
+# === BINANCE + TWILIO ===
+binance_client = BinanceClient(BINANCE_API_KEY, BINANCE_API_SECRET)
+twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+# === PARAMETRI BOT ===
+TRADE_SIZE = 1.0
+STOP_LOSS = -0.5/100
+TAKE_PROFIT1 = 1/100
+TAKE_PROFIT2 = 2/100
+MAX_POSITIONS = 5
+LOSS_ALERT_THRESHOLD = -3.0
 
 def send_whatsapp(message):
     twilio_client.messages.create(from_=TWILIO_WHATSAPP_NUMBER, body=message, to=DESTINATION_NUMBER)
