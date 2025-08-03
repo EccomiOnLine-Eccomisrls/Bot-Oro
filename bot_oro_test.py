@@ -27,25 +27,40 @@ sheet_operations = sh.sheet1
 
 # === FUNZIONI ===
 def send_whatsapp(message):
-    twilio_client.messages.create(
-        body=message,
-        from_=TWILIO_WHATSAPP_NUMBER,
-        to=DESTINATION_NUMBER
-    )
+    try:
+        twilio_client.messages.create(
+            body=message,
+            from_=TWILIO_WHATSAPP_NUMBER,
+            to=DESTINATION_NUMBER
+        )
+        print("[INFO] Messaggio inviato su WhatsApp.")
+    except Exception as e:
+        print("[ERRORE] Invio WhatsApp fallito:", e)
 
 def get_price():
-    data = binance_client.get_symbol_ticker(symbol="PAXGUSDT")
-    return float(data['price'])
+    try:
+        data = binance_client.get_symbol_ticker(symbol="PAXGUSDT")
+        return float(data['price'])
+    except Exception as e:
+        print("[ERRORE] Lettura prezzo Binance:", e)
+        return 0.0
 
 def log_trade():
     price = get_price()
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     sheet_operations.append_row([now, "TEST", price, "", "", "", price, "OK", "0.0", "Operazione di test"])
+    print(f"[OK] Operazione registrata su Google Sheets - Prezzo: {price}")
     send_whatsapp(f"📈 Bot ORO attivo! Prezzo PAXGUSDT: {price} USD - Operazione registrata.")
 
 # === AVVIO ===
-send_whatsapp("🚀 Bot ORO avviato con successo! Inizio test di 1 ora.")
+start_time = datetime.now().strftime("%d/%m/%Y %H:%M")
+price_now = get_price()
+send_whatsapp(f"🚀 Bot ORO avviato\nModalità: TEST\nUltimo prezzo PAXG/USDT: {price_now} USD\nProssima esecuzione: +30 minuti\nOra: {start_time}")
+print("[OK] Bot avviato correttamente.")
+
+# Eseguiamo 2 operazioni di test ogni 30 secondi
 for i in range(2):
     log_trade()
-    time.sleep(30)  # ogni 30 secondi per test veloce
+    time.sleep(30)
 send_whatsapp("✅ Test completato. Bot ORO operativo.")
+print("[OK] Test completato.")
