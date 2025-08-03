@@ -2,12 +2,12 @@
 import time
 import gspread
 from twilio.rest import Client
-from datetime import datetime
+from datetime import datetime, timedelta
 from binance.client import Client as BinanceClient
 import json
 import os
 
-# === CONFIG ===
+# === CONFIG da Environment ===
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
@@ -17,6 +17,12 @@ DESTINATION_NUMBER = os.getenv("DESTINATION_NUMBER")
 GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS")
 SPREADSHEET_NAME = "BOT ORO – TEST"
 
+STOP_LOSS = float(os.getenv("STOP_LOSS", -0.5))
+TAKE_PROFIT1 = float(os.getenv("TAKE_PROFIT1", 1))
+TAKE_PROFIT2 = float(os.getenv("TAKE_PROFIT2", 2))
+DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", -3))
+TRADE_SIZE = float(os.getenv("TRADE_SIZE", 1))
+
 # === CONNESSIONI ===
 binance_client = BinanceClient(BINANCE_API_KEY, BINANCE_API_SECRET)
 twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
@@ -24,6 +30,10 @@ creds = json.loads(GOOGLE_CREDENTIALS)
 gc = gspread.service_account_from_dict(creds)
 sh = gc.open(SPREADSHEET_NAME)
 sheet_operations = sh.sheet1
+try:
+    sheet_summary = sh.worksheet("Riepilogo")
+except:
+    sheet_summary = sh.add_worksheet(title="Riepilogo", rows=100, cols=10)
 
 # === FUNZIONI ===
 def send_whatsapp(message):
@@ -45,22 +55,51 @@ def get_price():
         print("[ERRORE] Lettura prezzo Binance:", e)
         return 0.0
 
+def simulate_trade(price_entry):
+    outcome = "WIN" if (datetime.now().second % 2 == 0) else "LOSS"
+    pct = TAKE_PROFIT1 if outcome == "WIN" else STOP_LOSS
+    return outcome, pct
+
 def log_trade():
     price = get_price()
+    outcome, profit_pct = simulate_trade(price)
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    sheet_operations.append_row([now, "TEST", price, "", "", "", price, "OK", "0.0", "Operazione di test"])
-    print(f"[OK] Operazione registrata su Google Sheets - Prezzo: {price}")
-    send_whatsapp(f"📈 Bot ORO attivo! Prezzo PAXGUSDT: {price} USD - Operazione registrata.")
+    profit_value = TRADE_SIZE * (profit_pct / 100)
+    sheet_operations.append_row([now, "SIMULAZIONE", price, STOP_LOSS, TAKE_PROFIT1, TAKE_PROFIT2, profit_value, outcome, profit_pct, "Operazione simulata"])
+    print(f"[OK] Operazione registrata: {outcome} {profit_pct}%")
+    return profit_pct
+
+def update_summary():
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    sheet_summary.append_row([now, "Aggiornamento", "Report automatico inviato"])
+
+def daily_report():
+    now = datetime.now().strftime("%Y-%m-%d")
+    sheet_summary.append_row([now, "Giornaliero", "Riepilogo giornaliero inviato"])
+    send_whatsapp(f"📅 Riepilogo Giornaliero {now}\nOperazioni simulate registrate.")
+
+def weekly_report():
+    now = datetime.now().strftime("%Y-%m-%d")
+    sheet_summary.append_row([now, "Settimanale", "Riepilogo settimanale inviato"])
+    send_whatsapp(f"📊 Riepilogo Settimanale {now}\nOperazioni simulate registrate.")
 
 # === AVVIO ===
-start_time = datetime.now().strftime("%d/%m/%Y %H:%M")
-price_now = get_price()
-send_whatsapp(f"🚀 Bot ORO avviato\nModalità: TEST\nUltimo prezzo PAXG/USDT: {price_now} USD\nProssima esecuzione: +30 minuti\nOra: {start_time}")
-print("[OK] Bot avviato correttamente.")
+send_whatsapp(f"🚀 Bot ORO Simulatore Avanzato avviato\nSL: {STOP_LOSS}% TP1: {TAKE_PROFIT1}% TP2: {TAKE_PROFIT2}%\nPerdita massima giornaliera: {DAILY_LOSS_LIMIT}%")
 
-# Eseguiamo 2 operazioni di test ogni 30 secondi
-for i in range(2):
-    log_trade()
-    time.sleep(30)
-send_whatsapp("✅ Test completato. Bot ORO operativo.")
-print("[OK] Test completato.")
+profit_today = 0
+while True:
+    profit_pct = log_trade()
+    profit_today += profit_pct
+    if profit_today <= DAILY_LOSS_LIMIT:
+        send_whatsapp(f"⚠️ Raggiunto limite perdita {DAILY_LOSS_LIMIT}%. Parametri adattati.")
+        TAKE_PROFIT1 *= 0.8
+        TAKE_PROFIT2 *= 0.8
+    hour = datetime.now().hour
+    minute = datetime.now().minute
+    if hour in [8,12,16,20] and minute == 0:
+        update_summary()
+    if hour == 0 and minute == 0:
+        daily_report()
+    if datetime.now().weekday() == 6 and hour == 0 and minute == 0:
+        weekly_report()
+    time.sleep(1800)  # ogni 30 minuti
