@@ -1,79 +1,74 @@
 
-import os
+import time
+import logging
 import gspread
-from datetime import datetime, timedelta
+from oauth2client.service_account import ServiceAccountCredentials
 from twilio.rest import Client
-from binance.client import Client as BinanceClient
 
-# ==== CONFIGURAZIONI ====
-SPREADSHEET_NAME = os.getenv("SPREADSHEET_NAME")
-WHATSAPP_FROM = os.getenv("WHATSAPP_FROM")
-WHATSAPP_TO = os.getenv("WHATSAPP_TO")
-TWILIO_SID = os.getenv("TWILIO_SID")
-TWILIO_TOKEN = os.getenv("TWILIO_TOKEN")
-BINANCE_API = os.getenv("BINANCE_API")
-BINANCE_SECRET = os.getenv("BINANCE_SECRET")
-LOSS_LIMIT = -3.0  # % massimo di perdita giornaliera
-SYMBOL = "PAXGUSDT"
-SL = -0.5
-TP1 = 1.0
-TP2 = 2.0
+# CONFIGURAZIONE
+GOOGLE_CREDENTIALS_FILE = 'google_credentials.json'  # Percorso del file credenziali
+SPREADSHEET_NAME = 'BotOroSheet'  # Nome del foglio Google
+TWILIO_SID = 'YOUR_TWILIO_SID'
+TWILIO_TOKEN = 'YOUR_TWILIO_TOKEN'
+TWILIO_WHATSAPP = 'whatsapp:+14155238886'
+DESTINATARIO = 'whatsapp:+39XXXXXXXXXX'
 
-# ==== CONNESSIONI ====
-gc = gspread.service_account(filename="bot-oro-4807603afb6b.json")
-sh = gc.open(SPREADSHEET_NAME)
-ws = sh.sheet1
-try:
-    report_ws = sh.worksheet("Report")
-except:
-    report_ws = sh.add_worksheet(title="Report", rows="1000", cols="10")
-twilio_client = Client(TWILIO_SID, TWILIO_TOKEN)
-binance_client = BinanceClient(BINANCE_API, BINANCE_SECRET)
+# Configurazione logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# ==== FUNZIONI ====
-def send_whatsapp(msg):
-    twilio_client.messages.create(
-        from_=f"whatsapp:{WHATSAPP_FROM}",
-        to=f"whatsapp:{WHATSAPP_TO}",
-        body=msg
-    )
+# Connessione a Twilio
+client = Client(TWILIO_SID, TWILIO_TOKEN)
 
-def get_price():
-    ticker = binance_client.get_symbol_ticker(symbol=SYMBOL)
-    return float(ticker['price'])
+# Funzione per invio messaggio WhatsApp
+def invia_messaggio(testo):
+    try:
+        client.messages.create(
+            from_=TWILIO_WHATSAPP,
+            body=testo,
+            to=DESTINATARIO
+        )
+        logging.info(f"Messaggio inviato: {testo}")
+    except Exception as e:
+        logging.error(f"Errore invio messaggio: {e}")
 
-def log_trade(price, note="Operazione di test"):
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    ws.append_row([now, "TEST", price, "", "", "", price, "OK", 0.0, note])
+# Connessione a Google Sheet
+def connessione_google():
+    try:
+        scope = ['https://spreadsheets.google.com/feeds','https://www.googleapis.com/auth/drive']
+        creds = ServiceAccountCredentials.from_json_keyfile_name(GOOGLE_CREDENTIALS_FILE, scope)
+        client_g = gspread.authorize(creds)
+        sheet = client_g.open(SPREADSHEET_NAME).sheet1
+        logging.info("Connessione a Google Sheet riuscita.")
+        return sheet
+    except Exception as e:
+        logging.error(f"Errore connessione Google Sheet: {e}")
+        invia_messaggio("⚠️ Errore connessione Google Sheet!")
+        return None
 
-def calculate_daily_stats():
-    today = datetime.now().strftime("%Y-%m-%d")
-    records = ws.get_all_records()
-    daily = [r for r in records if r['Data/Ora'].startswith(today)]
-    count = len(daily)
-    total_profit = sum(float(r.get('Profitto (%)', 0)) for r in daily)
-    return count, total_profit
-
-def write_daily_report():
-    count, profit = calculate_daily_stats()
-    now = datetime.now().strftime("%Y-%m-%d")
-    report_ws.append_row([f"Report Giornaliero {now}", count, profit])
-    send_whatsapp(f"📊 Report giornaliero {now}\nOperazioni: {count}\nProfitto: {profit:.2f}%")
-
-def write_weekly_report():
-    records = ws.get_all_records()
-    week_ago = datetime.now() - timedelta(days=7)
-    weekly = [r for r in records if datetime.strptime(r['Data/Ora'], "%Y-%m-%d %H:%M") >= week_ago]
-    count = len(weekly)
-    total_profit = sum(float(r.get('Profitto (%)', 0)) for r in weekly)
-    report_ws.append_row([f"Report Settimanale {datetime.now().strftime('%Y-%m-%d')}", count, total_profit])
-    send_whatsapp(f"📊 Report settimanale\nOperazioni: {count}\nProfitto: {total_profit:.2f}%")
-
+# Ciclo principale
 def main():
-    price = get_price()
-    log_trade(price)
-    send_whatsapp(f"📈 Bot ORO attivo! Prezzo {SYMBOL}: {price} USD - Operazione registrata.")
-    print("[OK] Operazione registrata.")
+    invia_messaggio("🚀 Bot ORO avviato e funzionante.")
+    last_checked_row = 1
+    while True:
+        try:
+            sheet = connessione_google()
+            if not sheet:
+                time.sleep(30)
+                continue
+            dati = sheet.get_all_records()
+            for idx, riga in enumerate(dati, start=2):
+                if idx <= last_checked_row:
+                    continue
+                esito = riga.get('G')
+                if esito in ['WIN', 'LOSS']:
+                    prezzo = riga.get('C')
+                    invia_messaggio(f"📈 Nuova operazione: {esito} - Prezzo: {prezzo}")
+                last_checked_row = idx
+            time.sleep(60)  # Controlla ogni 60 secondi
+        except Exception as e:
+            logging.error(f"Errore nel ciclo principale: {e}")
+            invia_messaggio("⚠️ Bot ORO riavviato per errore.")
+            time.sleep(10)
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
