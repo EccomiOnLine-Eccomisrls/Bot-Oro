@@ -7,7 +7,7 @@ from twilio.rest import Client
 
 # CONFIGURAZIONE
 GOOGLE_CREDENTIALS_FILE = 'google_credentials.json'  # Percorso del file credenziali
-SPREADSHEET_NAME = 'BotOroSheet'  # Nome del foglio Google
+SPREADSHEET_NAME = "BOT ORO – TEST"  # Nome del foglio Google
 TWILIO_SID = 'YOUR_TWILIO_SID'
 TWILIO_TOKEN = 'YOUR_TWILIO_TOKEN'
 TWILIO_WHATSAPP = 'whatsapp:+14155238886'
