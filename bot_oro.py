@@ -20,6 +20,10 @@ DESTINATION_NUMBER = "whatsapp:+393205616977"     # Il tuo numero (abilitato al 
 
 # Google Sheets
 import json
+
+# Recupera la variabile d'ambiente
+GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS") or os.getenv("GOOGLE_CREDENTIALS_JSON")
+
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 
 if not GOOGLE_CREDENTIALS:
