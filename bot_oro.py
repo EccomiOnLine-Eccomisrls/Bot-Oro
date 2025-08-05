@@ -23,7 +23,7 @@ sheet_operations = sheet.sheet1
 twilio_sid = os.environ["TWILIO_ACCOUNT_SID"]
 twilio_token = os.environ["TWILIO_AUTH_TOKEN"]
 twilio_phone = os.environ["TWILIO_WHATSAPP_NUMBER"]
-twilio_to = os.environ["TWILIO_TO"]
+twilio_to = os.environ.get("TWILIO_TO") or os.environ.get("DESTINATION_NUMBER")
 twilio_client = Client(twilio_sid, twilio_token)
 
 # Binance (se serve)
