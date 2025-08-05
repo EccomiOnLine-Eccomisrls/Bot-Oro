@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import json
 import gspread
 from twilio.rest import Client
 from binance.client import Client as BinanceClient
@@ -55,7 +56,6 @@ binance_client = BinanceClient(api_key=binance_api_key, api_secret=binance_api_s
 
 # === Inizializza Google Sheets ===
 try:
-    import json
     creds_dict = json.loads(google_credentials_json)
     creds = Credentials.from_service_account_info(creds_dict, scopes=["https://www.googleapis.com/auth/spreadsheets"])
     gc = gspread.authorize(creds)
@@ -70,8 +70,9 @@ def invia_messaggio(messaggio):
     try:
         numero_from = f"whatsapp:{twilio_whatsapp}" if twilio_whatsapp else None
         numero_to = f"whatsapp:{twilio_to}" if twilio_to else None
+        print(f"[DEBUG] FROM: {numero_from}, TO: {numero_to}, BODY: {messaggio}")
         if not numero_from or not numero_to:
-            print("[ERRORE] Numeri Twilio non configurati correttamente.")
+            print(f"[ERRORE] Numeri Twilio non configurati: FROM={numero_from}, TO={numero_to}")
             return
         twilio_client.messages.create(
             body=messaggio,
@@ -80,12 +81,15 @@ def invia_messaggio(messaggio):
         )
         print(f"[INFO] Messaggio inviato a {numero_to}")
     except Exception as e:
+        import traceback
         print(f"[ERRORE] Invio messaggio fallito: {e}")
+        traceback.print_exc()
 
 # === Funzione principale ===
 def main():
     print("[INFO] Bot avviato.")
-    invia_messaggio("Bot Oro avviato correttamente 🚀")
+    # Test: invia un messaggio WhatsApp al riavvio
+    invia_messaggio("✅ Bot Oro avviato correttamente 🚀")
     # Qui va la tua logica di trading / monitoraggio
     while True:
         # ESEMPIO: stampa saldo USDT ogni 60 secondi
