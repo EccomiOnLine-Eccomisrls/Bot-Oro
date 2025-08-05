@@ -19,8 +19,15 @@ TWILIO_WHATSAPP_NUMBER = "whatsapp:+14155238886"  # Numero sandbox Twilio
 DESTINATION_NUMBER = "whatsapp:+393205616977"     # Il tuo numero (abilitato al sandbox)
 
 # Google Sheets
-SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
-GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS")
+import json
+scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+
+if not GOOGLE_CREDENTIALS:
+    raise Exception("Variabile d'ambiente GOOGLE_CREDENTIALS non trovata")
+
+credentials = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(GOOGLE_CREDENTIALS), scope)
+gc = gspread.authorize(credentials)
+sheet = gc.open_by_key(SPREADSHEET_ID).sheet1
 
 # Trading
 TRADE_SIZE = float(os.getenv("TRADE_SIZE", 1))
