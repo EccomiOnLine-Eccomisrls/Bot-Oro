@@ -1,51 +1,31 @@
 import os
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
-from twilio.rest import Client
-from datetime import datetime
+import sys
 
-# === FUNZIONE DI SUPPORTO PER LE VARIABILI ENV ===
-def get_env_var(name):
-    value = os.environ.get(name)
-    if not value:
-        raise RuntimeError(f"❌ Variabile d'ambiente mancante: {name}")
+def get_env_var(name, default=None, required=False):
+    """Recupera una variabile d'ambiente e gestisce i valori mancanti."""
+    value = os.environ.get(name, default)
+    if required and value is None:
+        print(f"[ERRORE] Variabile d'ambiente '{name}' non trovata!")
     return value
 
-# === GOOGLE SHEETS ===
-GOOGLE_CREDENTIALS_JSON = get_env_var("GOOGLE_CREDENTIALS_JSON")
-SPREADSHEET_ID = get_env_var("SPREADSHEET_ID")
-
-scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-credentials = ServiceAccountCredentials.from_json_keyfile_dict(eval(GOOGLE_CREDENTIALS_JSON), scope)
-client = gspread.authorize(credentials)
-sheet = client.open_by_key(SPREADSHEET_ID).sheet1  # Primo foglio
-
 # === TWILIO ===
-twilio_sid = get_env_var("TWILIO_ACCOUNT_SID")
-twilio_token = get_env_var("TWILIO_AUTH_TOKEN")
-twilio_from = get_env_var("TWILIO_WHATSAPP_NUMBER")
-twilio_to = get_env_var("DESTINATION_NUMBER")
+twilio_to = get_env_var('TWILTO_TO') or get_env_var('DESTINATION_NUMBER')  # fallback
+twilio_sid = get_env_var('TWILIO_SID', required=True)
+twilio_token = get_env_var('TWILIO_AUTH_TOKEN', required=True)
 
-twilio_client = Client(twilio_sid, twilio_token)
+# === BINANCE ===
+binance_api_key = get_env_var('BINANCE_API_KEY', required=True)
+binance_api_secret = get_env_var('BINANCE_API_SECRET', required=True)
 
-# === FUNZIONE PRINCIPALE ===
-def main():
-    now = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-    print(f"Bot avviato alle {now}")
+# === LIMITI ===
+daily_loss_limit = get_env_var('DAILY_LOSS_LIMIT', default="0")  # valore di default 0
 
-    # Aggiorna una cella sul foglio (evita warning: ora valori prima e range dopo)
-    first_empty_row = len(sheet.col_values(1)) + 1
-    sheet.update([[f"Bot attivo – {now}"]], f'K{first_empty_row}')
+# === GOOGLE ===
+google_credentials = get_env_var('GOOGLE_CREDENTIALS', required=True)
 
-    # Invia messaggio WhatsApp di notifica
-    twilio_client.messages.create(
-        from_=twilio_from,
-        to=twilio_to,
-        body=f"✅ Bot Oro attivo alle {now}"
-    )
+# Verifica finale: se mancano variabili critiche, esci
+if not all([twilio_to, twilio_sid, twilio_token, binance_api_key, binance_api_secret, google_credentials]):
+    print("[ERRORE] Variabili d'ambiente critiche mancanti. Controlla le impostazioni su Render.")
+    sys.exit(1)
 
-if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        print(f"Errore durante l'esecuzione: {e}")
+print("[INFO] Variabili d'ambiente caricate correttamente.")
