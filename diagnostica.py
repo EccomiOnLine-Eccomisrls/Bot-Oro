@@ -1,28 +1,38 @@
-import os
-import json
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+from datetime import datetime
+import json
+import os
 
-SPREADSHEET_NAME = "BOT ORO – TEST"
-print("Avvio diagnostica...")
+print("\nAvvio diagnostica...")
 
 try:
-    # Leggi credenziali dai secrets
-    creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
+    # Leggi credenziali dal secret su Render
+    creds_json = os.environ.get("GOOGLE_CREDENTIALS")
     if not creds_json:
-        raise Exception("Variabile d'ambiente GOOGLE_CREDENTIALS_JSON mancante")
+        raise Exception("Variabile GOOGLE_CREDENTIALS mancante.")
     creds_dict = json.loads(creds_json)
 
-    # Usa le credenziali direttamente da variabile
+    # Autenticazione
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-    client = gspread.authorize(creds)
+    gc = gspread.authorize(creds)
 
-    # Apertura foglio
-    sheet = client.open(SPREADSHEET_NAME)
+    # Nome del foglio
+    SPREADSHEET_NAME = "BOT ORO – TEST"
+    sh = gc.open(SPREADSHEET_NAME)
+    worksheet = sh.sheet1
+
+    # Leggi A1
+    a1_value = worksheet.acell('A1').value
     print(f"Connessione riuscita al foglio: {SPREADSHEET_NAME}")
-    print(f"Valore in A1: {sheet.sheet1.cell(1, 1).value}")
+    print(f"Valore in A1: {a1_value}")
+
+    # Scrivi in B1
+    now = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    worksheet.update('B1', f"Connessione OK - {now}")
+    print(f"Scritto in B1: Connessione OK - {now}")
 
 except Exception as e:
-    print("ERRORE durante la diagnostica:")
-    print(e)
+    print("\nERRORE durante la diagnostica:")
+    print(str(e))
