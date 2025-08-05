@@ -30,7 +30,7 @@ try:
 
     # Scrivi in B1
     now = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-    worksheet.update('B1', f"Connessione OK - {now}")
+    worksheet.update_acell('B1', f"Connessione OK - {now}")
     print(f"Scritto in B1: Connessione OK - {now}")
 
 except Exception as e:
