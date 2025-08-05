@@ -20,9 +20,9 @@ sheet = client.open_by_key(os.environ["SPREADSHEET_ID"])  # <-- ID del foglio da
 sheet_operations = sheet.sheet1
 
 # Twilio (per invio messaggi)
-twilio_sid = os.environ["TWILIO_SID"]
-twilio_token = os.environ["TWILIO_TOKEN"]
-twilio_from = os.environ["TWILIO_FROM"]
+twilio_sid = os.environ["TWILIO_ACCOUNT_SID"]
+twilio_token = os.environ["TWILIO_AUTH_TOKEN"]
+twilio_phone = os.environ["TWILIO_WHATSAPP_NUMBER"]
 twilio_to = os.environ["TWILIO_TO"]
 twilio_client = Client(twilio_sid, twilio_token)
 
