@@ -1,74 +1,118 @@
-
 import time
-import logging
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
 from twilio.rest import Client
+from datetime import datetime, timedelta
+from binance.client import Client as BinanceClient
+import json
+import os
 
-# CONFIGURAZIONE
-GOOGLE_CREDENTIALS_FILE = 'google_credentials.json'  # Percorso del file credenziali
-SPREADSHEET_NAME = "BOT ORO – TEST"  # Nome del foglio Google
-TWILIO_SID = 'YOUR_TWILIO_SID'
-TWILIO_TOKEN = 'YOUR_TWILIO_TOKEN'
-TWILIO_WHATSAPP = 'whatsapp:+14155238886'
-DESTINATARIO = 'whatsapp:+39XXXXXXXXXX'
+# === CONFIG da Environment ===
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
+BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER")
+DESTINATION_NUMBER = os.getenv("DESTINATION_NUMBER")
+GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS")
+SPREADSHEET_NAME = "BOT ORO – TEST"
 
-# Configurazione logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+STOP_LOSS = float(os.getenv("STOP_LOSS", -0.5))
+TAKE_PROFIT1 = float(os.getenv("TAKE_PROFIT1", 1))
+TAKE_PROFIT2 = float(os.getenv("TAKE_PROFIT2", 2))
+DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", -3))
+TRADE_SIZE = float(os.getenv("TRADE_SIZE", 1))
 
-# Connessione a Twilio
-client = Client(TWILIO_SID, TWILIO_TOKEN)
+# === CONNESSIONI ===
+binance_client = BinanceClient(BINANCE_API_KEY, BINANCE_API_SECRET)
+twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+creds = json.loads(GOOGLE_CREDENTIALS)
+gc = gspread.service_account_from_dict(creds)
+sh = gc.open(SPREADSHEET_NAME)
+sheet_operations = sh.sheet1
 
-# Funzione per invio messaggio WhatsApp
-def invia_messaggio(testo):
+# Prova a caricare/creare il foglio "Riepilogo"
+try:
+    sheet_summary = sh.worksheet("Riepilogo")
+except:
+    sheet_summary = sh.add_worksheet(title="Riepilogo", rows=100, cols=10)
+
+# Prova a caricare/creare il foglio "Log Bot"
+try:
+    sheet_log = sh.worksheet("Log Bot")
+except:
+    sheet_log = sh.add_worksheet(title="Log Bot", rows=500, cols=6)
+    sheet_log.append_row(["Data/Ora", "Prezzo", "Outcome", "Profitto %", "Profitto Valore", "Note"])
+
+# === FUNZIONI ===
+def send_whatsapp(message):
     try:
-        client.messages.create(
-            from_=TWILIO_WHATSAPP,
-            body=testo,
-            to=DESTINATARIO
+        twilio_client.messages.create(
+            body=message,
+            from_=TWILIO_WHATSAPP_NUMBER,
+            to=DESTINATION_NUMBER
         )
-        logging.info(f"Messaggio inviato: {testo}")
+        print("[INFO] Messaggio inviato su WhatsApp.")
     except Exception as e:
-        logging.error(f"Errore invio messaggio: {e}")
+        print("[ERRORE] Invio WhatsApp fallito:", e)
 
-# Connessione a Google Sheet
-def connessione_google():
+def get_price():
     try:
-        scope = ['https://spreadsheets.google.com/feeds','https://www.googleapis.com/auth/drive']
-        creds = ServiceAccountCredentials.from_json_keyfile_name(GOOGLE_CREDENTIALS_FILE, scope)
-        client_g = gspread.authorize(creds)
-        sheet = client_g.open(SPREADSHEET_NAME).sheet1
-        logging.info("Connessione a Google Sheet riuscita.")
-        return sheet
+        data = binance_client.get_symbol_ticker(symbol="PAXGUSDT")
+        return float(data['price'])
     except Exception as e:
-        logging.error(f"Errore connessione Google Sheet: {e}")
-        invia_messaggio("⚠️ Errore connessione Google Sheet!")
-        return None
+        print("[ERRORE] Lettura prezzo Binance:", e)
+        return 0.0
 
-# Ciclo principale
-def main():
-    invia_messaggio("🚀 Bot ORO avviato e funzionante.")
-    last_checked_row = 1
-    while True:
-        try:
-            sheet = connessione_google()
-            if not sheet:
-                time.sleep(30)
-                continue
-            dati = sheet.get_all_records()
-            for idx, riga in enumerate(dati, start=2):
-                if idx <= last_checked_row:
-                    continue
-                esito = riga.get('G')
-                if esito in ['WIN', 'LOSS']:
-                    prezzo = riga.get('C')
-                    invia_messaggio(f"📈 Nuova operazione: {esito} - Prezzo: {prezzo}")
-                last_checked_row = idx
-            time.sleep(60)  # Controlla ogni 60 secondi
-        except Exception as e:
-            logging.error(f"Errore nel ciclo principale: {e}")
-            invia_messaggio("⚠️ Bot ORO riavviato per errore.")
-            time.sleep(10)
+def simulate_trade(price_entry):
+    outcome = "WIN" if (datetime.now().second % 2 == 0) else "LOSS"
+    pct = TAKE_PROFIT1 if outcome == "WIN" else STOP_LOSS
+    return outcome, pct
 
-if __name__ == '__main__':
-    main()
+def log_trade():
+    price = get_price()
+    outcome, profit_pct = simulate_trade(price)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    profit_value = TRADE_SIZE * (profit_pct / 100)
+    # Scrivi nella sheet principale
+    sheet_operations.append_row([now, "SIMULAZIONE", price, STOP_LOSS, TAKE_PROFIT1, TAKE_PROFIT2, profit_value, outcome, profit_pct, "Operazione simulata"])
+    # Scrivi anche nel log
+    sheet_log.append_row([now, price, outcome, profit_pct, profit_value, "Operazione registrata"])
+    print(f"[OK] Operazione registrata: {outcome} {profit_pct}%")
+    return profit_pct
+
+def update_summary():
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    sheet_summary.append_row([now, "Aggiornamento", "Report automatico inviato"])
+
+def daily_report():
+    now = datetime.now().strftime("%Y-%m-%d")
+    sheet_summary.append_row([now, "Giornaliero", "Riepilogo giornaliero inviato"])
+    send_whatsapp(f"📅 Riepilogo Giornaliero {now}\nOperazioni simulate registrate.")
+
+def weekly_report():
+    now = datetime.now().strftime("%Y-%m-%d")
+    sheet_summary.append_row([now, "Settimanale", "Riepilogo settimanale inviato"])
+    send_whatsapp(f"📊 Riepilogo Settimanale {now}\nOperazioni simulate registrate.")
+
+# === AVVIO ===
+now = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+sheet_operations.update('B1', f"Bot attivo – {now}")
+send_whatsapp(f"🚀 Bot ORO Simulatore Avanzato avviato\nSL: {STOP_LOSS}% TP1: {TAKE_PROFIT1}% TP2: {TAKE_PROFIT2}%\nPerdita massima giornaliera: {DAILY_LOSS_LIMIT}%")
+
+profit_today = 0
+while True:
+    profit_pct = log_trade()
+    profit_today += profit_pct
+    if profit_today <= DAILY_LOSS_LIMIT:
+        send_whatsapp(f"⚠️ Raggiunto limite perdita {DAILY_LOSS_LIMIT}%. Parametri adattati.")
+        TAKE_PROFIT1 *= 0.8
+        TAKE_PROFIT2 *= 0.8
+    hour = datetime.now().hour
+    minute = datetime.now().minute
+    if hour in [8,12,16,20] and minute == 0:
+        update_summary()
+    if hour == 0 and minute == 0:
+        daily_report()
+    if datetime.now().weekday() == 6 and hour == 0 and minute == 0:
+        weekly_report()
+    time.sleep(1800)  # ogni 30 minuti
