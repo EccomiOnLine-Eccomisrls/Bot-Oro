@@ -21,6 +21,7 @@ DESTINATION_NUMBER = os.getenv("TWILIO_TO", "whatsapp:+393205616977")
 # Google Sheets
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS") or os.getenv("GOOGLE_CREDENTIALS_JSON")
+SHEET_NAME = os.getenv("SHEET_NAME", "Foglio1")  # <--- Nuova variabile: nome del foglio
 
 # Controlli
 if not SPREADSHEET_ID:
@@ -46,7 +47,8 @@ twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 credentials = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(GOOGLE_CREDENTIALS), scope)
 gc = gspread.authorize(credentials)
-sheet = gc.open_by_key(SPREADSHEET_ID).sheet1
+sheet = gc.open_by_key(SPREADSHEET_ID).worksheet(SHEET_NAME)  # <--- Usa il nome del foglio
+print(f"[SHEETS] Connesso al foglio: {SHEET_NAME}")
 
 # ======= FUNZIONI =======
 def invia_messaggio(messaggio):
@@ -69,7 +71,7 @@ def scrivi_su_sheets(dati):
 
 # ======= CICLO PRINCIPALE =======
 def main():
-    invia_messaggio("🤖 Bot Oro avviato correttamente e operativo!")
+    invia_messaggio(f"🤖 Bot Oro avviato correttamente! Scriverò sul foglio: {SHEET_NAME}")
     while True:
         try:
             prezzo = float(binance_client.get_symbol_ticker(symbol="XAUUSDT")["price"])
