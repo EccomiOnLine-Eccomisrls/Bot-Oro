@@ -29,19 +29,10 @@ creds = json.loads(GOOGLE_CREDENTIALS)
 gc = gspread.service_account_from_dict(creds)
 sh = gc.open(SPREADSHEET_NAME)
 sheet_operations = sh.sheet1
-
-# Prova a caricare/creare il foglio "Riepilogo"
 try:
     sheet_summary = sh.worksheet("Riepilogo")
 except:
     sheet_summary = sh.add_worksheet(title="Riepilogo", rows=100, cols=10)
-
-# Prova a caricare/creare il foglio "Log Bot"
-try:
-    sheet_log = sh.worksheet("Log Bot")
-except:
-    sheet_log = sh.add_worksheet(title="Log Bot", rows=500, cols=6)
-    sheet_log.append_row(["Data/Ora", "Prezzo", "Outcome", "Profitto %", "Profitto Valore", "Note"])
 
 # === FUNZIONI ===
 def send_whatsapp(message):
@@ -63,7 +54,7 @@ def get_price():
         print("[ERRORE] Lettura prezzo Binance:", e)
         return 0.0
 
-def simulate_trade(price_entry):
+def simulate_trade(price):
     outcome = "WIN" if (datetime.now().second % 2 == 0) else "LOSS"
     pct = TAKE_PROFIT1 if outcome == "WIN" else STOP_LOSS
     return outcome, pct
@@ -73,10 +64,10 @@ def log_trade():
     outcome, profit_pct = simulate_trade(price)
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     profit_value = TRADE_SIZE * (profit_pct / 100)
-    # Scrivi nella sheet principale
-    sheet_operations.append_row([now, "SIMULAZIONE", price, STOP_LOSS, TAKE_PROFIT1, TAKE_PROFIT2, profit_value, outcome, profit_pct, "Operazione simulata"])
-    # Scrivi anche nel log
-    sheet_log.append_row([now, price, outcome, profit_pct, profit_value, "Operazione registrata"])
+    sheet_operations.append_row([
+        now, "SIMULAZIONE", price, STOP_LOSS, TAKE_PROFIT1, TAKE_PROFIT2,
+        profit_value, outcome, profit_pct, "Operazione simulata"
+    ])
     print(f"[OK] Operazione registrata: {outcome} {profit_pct}%")
     return profit_pct
 
@@ -96,8 +87,15 @@ def weekly_report():
 
 # === AVVIO ===
 now = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-sheet_operations.update('B1', f"Bot attivo – {now}")
-send_whatsapp(f"🚀 Bot ORO Simulatore Avanzato avviato\nSL: {STOP_LOSS}% TP1: {TAKE_PROFIT1}% TP2: {TAKE_PROFIT2}%\nPerdita massima giornaliera: {DAILY_LOSS_LIMIT}%")
+try:
+    sheet_operations.update('B1', [[f"Bot attivo – {now}"]])  # <<< FIX QUI
+    print(f"[INFO] Stato bot aggiornato su Google Sheets: Bot attivo – {now}")
+except Exception as e:
+    print("[ERRORE] Impossibile aggiornare B1:", e)
+
+send_whatsapp(
+    f"🚀 Bot ORO Simulatore Avviato\nSL: {STOP_LOSS}% TP1: {TAKE_PROFIT1}% TP2: {TAKE_PROFIT2}%\nPerdita massima giornaliera: {DAILY_LOSS_LIMIT}%"
+)
 
 profit_today = 0
 while True:
