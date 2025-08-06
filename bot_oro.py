@@ -1,3 +1,4 @@
+
 import os
 import json
 import time
@@ -8,28 +9,16 @@ from twilio.rest import Client as TwilioClient
 from datetime import datetime
 
 # ======= CONFIGURAZIONE =======
-# Binance
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
-
-# Twilio
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886")
 DESTINATION_NUMBER = os.getenv("TWILIO_TO", "whatsapp:+393205616977")
-
-# Google Sheets
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS") or os.getenv("GOOGLE_CREDENTIALS_JSON")
-SHEET_NAME = os.getenv("SHEET_NAME", "Foglio1")  # <--- Nuova variabile: nome del foglio
+SHEET_NAME = os.getenv("SHEET_NAME", "Foglio1")
 
-# Controlli
-if not SPREADSHEET_ID:
-    raise Exception("Variabile d'ambiente SPREADSHEET_ID non trovata")
-if not GOOGLE_CREDENTIALS:
-    raise Exception("Variabile d'ambiente GOOGLE_CREDENTIALS non trovata")
-
-# Trading
 TRADE_SIZE = float(os.getenv("TRADE_SIZE", 1))
 STOP_LOSS = float(os.getenv("STOP_LOSS", -0.5))
 TAKE_PROFIT1 = float(os.getenv("TAKE_PROFIT1", 1))
@@ -37,17 +26,12 @@ TAKE_PROFIT2 = float(os.getenv("TAKE_PROFIT2", 2))
 DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", -3))
 
 # ======= CONNESSIONI =======
-# Binance
 binance_client = Client(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
-
-# Twilio
 twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-
-# Google Sheets
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 credentials = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(GOOGLE_CREDENTIALS), scope)
 gc = gspread.authorize(credentials)
-sheet = gc.open_by_key(SPREADSHEET_ID).worksheet(SHEET_NAME)  # <--- Usa il nome del foglio
+sheet = gc.open_by_key(SPREADSHEET_ID).worksheet(SHEET_NAME)
 print(f"[SHEETS] Connesso al foglio: {SHEET_NAME}")
 
 # ======= FUNZIONI =======

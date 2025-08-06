@@ -5,3 +5,4 @@ python-binance
 google-auth
 google-auth-oauthlib
 oauth2client
+requests
