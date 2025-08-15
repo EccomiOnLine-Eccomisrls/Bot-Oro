@@ -1,229 +1,248 @@
-# bot_oro.py — WS only + ALERTS_ENABLED
-import os, time, threading
-from dataclasses import dataclass
+# bot_oro.py
+# Bot Oro – v3 (WS Binance + Google Sheet + WhatsApp Cloud API)
+# - WebSocket puro su Binance (niente REST quota)
+# - Log su Google Sheets (SheetLogger)
+# - Alert via WhatsApp Cloud API (wa_meta.py) con fallback interno
+# - Strategia mock per test: apre/chiude operazioni su TP1/TP2/SL
+
+import os
+import json
+import time
+import asyncio
+import threading
+import websockets
 from datetime import datetime
-from binance import ThreadedWebsocketManager
-from twilio.rest import Client as TwilioClient
-from sheet_logger import SheetLogger
+from decimal import Decimal
 
-# ===== ENV =====
-SYMBOL = os.getenv("BINANCE_SYMBOL", "PAXGUSDT").upper()
+# ===== Sheets =====
+from sheet_logger import SheetLogger  # deve essere nel repo
 
-# Twilio / Alerts
-TWILIO_ACCOUNT_SID     = os.getenv("TWILIO_ACCOUNT_SID", "")
-TWILIO_AUTH_TOKEN      = os.getenv("TWILIO_AUTH_TOKEN", "")
-TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886")
-TWILIO_TO              = os.getenv("TWILIO_TO", "")
-ALERTS_ENABLED         = os.getenv("ALERTS_ENABLED", "true").lower() == "true"
+# ===== WhatsApp (Meta Cloud API) =====
+try:
+    from wa_meta import MetaWhatsApp  # preferito
+except Exception:
+    import requests
 
-# Strategia
-ENTRY_DROP   = float(os.getenv("ENTRY_DROP", 0.005))
-SL_PCT       = float(os.getenv("STOP_LOSS", 0.005))
-TP1_PCT      = float(os.getenv("TAKE_PROFIT1", 0.004))
-TP2_PCT      = float(os.getenv("TAKE_PROFIT2", 0.010))
-RISK_PCT     = float(os.getenv("RISK_PCT", 0.005))
-COOLDOWN_MIN = int(os.getenv("COOLDOWN_MIN", "15"))
-PING_EVERY   = int(os.getenv("PING_EVERY_SEC", "60"))
-REPORT_EVERY = int(os.getenv("REPORT_EVERY_SEC", "3600"))
-EQUITY_START = float(os.getenv("EQUITY_START", 10000.0))
+    class MetaWhatsApp:
+        def __init__(self, token=None, phone_id=None, default_to=None, timeout=15):
+            self.token = token or os.getenv("WA_TOKEN", "")
+            self.phone_id = phone_id or os.getenv("WA_PHONE_ID", "")
+            self.default_to = default_to or os.getenv("WA_TO", "")
+            self.timeout = timeout
+            if not self.token or not self.phone_id:
+                raise ValueError("WA_TOKEN o WA_PHONE_ID mancanti per WhatsApp Cloud API.")
+            self.base_url = f"https://graph.facebook.com/v20.0/{self.phone_id}/messages"
+            self.headers = {"Authorization": f"Bearer {self.token}"}
 
-# ===== Servizi =====
-twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) if (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN) else None
-sheet = SheetLogger()
+        def send_text(self, body: str, to: str | None = None) -> dict:
+            to = (to or self.default_to or "").strip()
+            if not to:
+                raise ValueError("Numero destinatario mancante (WA_TO). Usa solo cifre, senza +.")
+            payload = {
+                "messaging_product": "whatsapp",
+                "to": to,
+                "type": "text",
+                "text": {"preview_url": False, "body": body},
+            }
+            r = requests.post(self.base_url, headers=self.headers, json=payload, timeout=self.timeout)
+            r.raise_for_status()
+            return r.json()
 
-def send_whatsapp(text: str):
+# ================== CONFIG ==================
+ALERTS_ENABLED = os.getenv("ALERTS_ENABLED", "true").lower() == "true"
+WA_PROVIDER = os.getenv("WA_PROVIDER", "meta").lower()  # meta | (altro: non usato)
+
+SYMBOL = os.getenv("SYMBOL", "paxgusdt").lower()  # stream WS
+HEARTBEAT_SEC = int(os.getenv("HEARTBEAT_SEC", "60"))
+
+TRADE_SIZE = Decimal(os.getenv("TRADE_SIZE", "0.001"))  # quantità fittizia per test
+STOP_LOSS = Decimal(os.getenv("STOP_LOSS", "-0.5"))
+TP1 = Decimal(os.getenv("TAKE_PROFIT1", "0.2"))
+TP2 = Decimal(os.getenv("TAKE_PROFIT2", "0.4"))
+STRATEGY_TAG = os.getenv("STRATEGY_TAG", "v1")
+
+# ================== GLOBAL STATE ==================
+latest_price: Decimal | None = None
+price_ts: float | None = None
+ws_thread: threading.Thread | None = None
+ws_stop = threading.Event()
+
+open_positions = []  # lista di dict: {id, side, entry, qty, sl_pct, tp1_pct, tp2_pct, state}
+
+# ================== HELPERS ==================
+def now_str():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def send_whatsapp(msg: str):
     if not ALERTS_ENABLED:
-        print("[WHATSAPP] Disattivato (ALERTS_ENABLED=false).", text)
-        return
-    if not twilio_client or not TWILIO_TO:
-        print("[WHATSAPP] Config mancante, salto invio.", text)
         return
     try:
-        twilio_client.messages.create(body=text, from_=TWILIO_WHATSAPP_NUMBER, to=TWILIO_TO)
-        print("[WHATSAPP] Inviato.")
+        if WA_PROVIDER != "meta":
+            print("[WA] Provider non supportato, salta invio.")
+            return
+        MetaWhatsApp().send_text(msg)
+        print("[WA] OK:", msg[:100])
     except Exception as e:
-        print("[WHATSAPP][ERR]", e)
+        print("[WA] ERRORE:", e)
 
-# ===== WebSocket Ticker =====
-latest_price = None
-latest_ts    = 0.0
-ws_lock      = threading.Lock()
-twm          = None
 
-def _on_msg(msg):
-    global latest_price, latest_ts
-    try:
-        p = None
-        if isinstance(msg, dict):
-            if 'c' in msg: p = msg['c']
-            elif 'data' in msg and 'c' in msg['data']: p = msg['data']['c']
-        if p is not None:
-            with ws_lock:
-                latest_price = float(p)
-                latest_ts = time.time()
-    except Exception as e:
-        print("[WS][PARSE][ERR]", e)
+# ================== WEBSOCKET LISTENER ==================
+async def price_stream(symbol: str):
+    """Apre un WS su stream pubblici Binance e aggiorna latest_price."""
+    global latest_price, price_ts
+    stream_url = f"wss://stream.binance.com:9443/ws/{symbol}@trade"
+    backoff = 1
+    while not ws_stop.is_set():
+        try:
+            async with websockets.connect(stream_url, ping_interval=20, ping_timeout=20) as ws:
+                print(f"[WS] Connesso a {stream_url}")
+                backoff = 1
+                async for msg in ws:
+                    if ws_stop.is_set():
+                        break
+                    data = json.loads(msg)
+                    # prezzo trade: "p" come stringa
+                    p = Decimal(data.get("p"))
+                    latest_price = p
+                    price_ts = time.time()
+        except Exception as e:
+            print("[WS] Disconnesso/errore:", e)
+            if ws_stop.is_set():
+                break
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 30)  # exponential backoff max 30s
 
-def ws_start():
-    global twm
-    twm = ThreadedWebsocketManager()
-    twm.start()
-    twm.start_symbol_ticker_socket(callback=_on_msg, symbol=SYMBOL)
 
-def ws_stop():
-    global twm
-    if twm:
-        twm.stop()
-        twm = None
+def start_ws():
+    loop = asyncio.new_event_loop()
+    def runner():
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(price_stream(SYMBOL))
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+    return t
 
-def get_price_ws(timeout_stale=30):
-    now = time.time()
-    with ws_lock:
-        lp, ts = latest_price, latest_ts
-    if lp is not None and (now - ts) <= timeout_stale:
-        return lp
-    return None
+# ================== TRADING MOCK LOGIC ==================
+def open_position(price: Decimal, side: str = "LONG"):
+    """Apre un trade fittizio e lo registra su Sheet."""
+    trade_id = f"PAXGUSDT-{int(time.time()*1000)}"
+    pos = {
+        "id": trade_id,
+        "side": side,
+        "entry": price,
+        "qty": float(TRADE_SIZE),
+        "sl_pct": float(STOP_LOSS),
+        "tp1_pct": float(TP1),
+        "tp2_pct": float(TP2),
+        "state": "APERTO",
+    }
+    open_positions.append(pos)
 
-# ===== Modello posizione & logica =====
-@dataclass
-class Position:
-    trade_id: str
-    side: str
-    entry: float
-    qty: float
-    tp_pct: float
-    sl_pct: float
-    open_ts: float
+    # log su sheet
+    sheet.log_open(
+        trade_id=trade_id,
+        side=side,
+        entry_price=float(price),
+        qty=float(TRADE_SIZE),
+        sl_pct=float(STOP_LOSS),
+        tp1_pct=float(TP1),
+        tp2_pct=float(TP2),
+        strategy=STRATEGY_TAG,
+        note="apertura mock"
+    )
+    send_whatsapp(f"🚀 APERTURA {side}\nID: {trade_id}\nEntry: {price}\nTP1 {TP1}% · TP2 {TP2}% · SL {STOP_LOSS}%")
+    print("[TRADE] OPEN", pos)
 
-equity = EQUITY_START
-open_positions: list[Position] = []
-cooldown_until = 0.0
-anchor_high = None
 
-def position_size(entry: float, sl_pct: float, risk_pct: float) -> float:
-    global equity
-    risk_amount = equity * risk_pct
-    per_unit_loss = entry * sl_pct
-    if per_unit_loss <= 0:
-        return 0.0
-    return max(risk_amount / per_unit_loss, 0.0)
-
-def log_open_pair(entry: float):
-    global open_positions
-    base_qty = position_size(entry, SL_PCT, RISK_PCT)
-    if base_qty <= 0:
+def close_position(pos: dict, close_price: Decimal, reason: str):
+    """Chiude trade fittizio e aggiorna Sheet."""
+    if pos.get("state") != "APERTO":
         return
-    qty_half = round(base_qty / 2, 6)
-    ts = int(time.time())
+    pos["state"] = "CHIUSO"
+    pnl_pct = float(((close_price - pos["entry"]) / pos["entry"]) * 100) if pos["side"] == "LONG" \
+        else float(((pos["entry"] - close_price) / pos["entry"]) * 100)
+    pnl_value = float(Decimal(pnl_pct) / Decimal(100) * Decimal(pos["qty"]) * close_price)
 
-    trade_id_a = f"{SYMBOL}-{ts}-A"
-    sheet.log_open(trade_id=trade_id_a, side="LONG", entry_price=entry, qty=qty_half,
-                   sl_pct=SL_PCT, tp1_pct=TP1_PCT, tp2_pct=TP2_PCT, strategy="v1", note="TP1")
-    open_positions.append(Position(trade_id_a, "LONG", entry, qty_half, TP1_PCT, SL_PCT, time.time()))
-
-    trade_id_b = f"{SYMBOL}-{ts}-B"
-    sheet.log_open(trade_id=trade_id_b, side="LONG", entry_price=entry, qty=qty_half,
-                   sl_pct=SL_PCT, tp1_pct=TP1_PCT, tp2_pct=TP2_PCT, strategy="v1", note="TP2")
-    open_positions.append(Position(trade_id_b, "LONG", entry, qty_half, TP2_PCT, SL_PCT, time.time()))
-
-    send_whatsapp(
-        f"🟢 APERTI {SYMBOL}\nEntry {entry:.2f}\nQty tot {qty_half*2:.6f}\n"
-        f"SL {SL_PCT*100:.2f}% · TP1 {TP1_PCT*100:.2f}% · TP2 {TP2_PCT*100:.2f}%"
+    sheet.log_close(
+        trade_id=pos["id"],
+        close_price=float(close_price),
+        close_type=reason,
+        pnl_pct=round(pnl_pct, 4),
+        pnl_value=round(pnl_value, 2),
+        equity_after="",  # opzionale: se vuoi calcolare l'equity cumulata
+        note=reason
     )
+    send_whatsapp(f"✅ CHIUSURA ({reason})\nID: {pos['id']}\nClose: {close_price}\nPnL: {pnl_pct:.3f}%")
+    print("[TRADE] CLOSE", pos["id"], reason)
 
-def close_position(p: Position, close_price: float, reason: str):
-    global equity, open_positions
-    pnl_value = (close_price - p.entry) * p.qty
-    pnl_pct   = ((close_price - p.entry) / p.entry) * 100.0
-    equity   += pnl_value
-    sheet.log_close(trade_id=p.trade_id, close_price=close_price, close_type=reason,
-                    pnl_pct=round(pnl_pct, 4), pnl_value=round(pnl_value, 2),
-                    equity_after=round(equity, 2), note=reason)
-    send_whatsapp(
-        f"⚪️ CHIUSO {p.trade_id} {reason}\n"
-        f"Entry {p.entry:.2f} → Close {close_price:.2f}\n"
-        f"P&L {pnl_pct:.3f}%  ({pnl_value:.2f})\nEquity {equity:.2f}"
-    )
-    open_positions = [x for x in open_positions if x.trade_id != p.trade_id]
 
-def maybe_open(price: float):
-    global anchor_high
-    if anchor_high is None:
-        anchor_high = price
-        return False
-    if price > anchor_high:
-        anchor_high = price
-        return False
-    trigger = anchor_high * (1.0 - ENTRY_DROP)
-    if price <= trigger:
-        log_open_pair(price)
-        anchor_high = None
-        return True
-    return False
+def manage_positions(current_price: Decimal):
+    """Controlla TP/SL per tutte le posizioni aperte."""
+    for pos in list(open_positions):
+        if pos["state"] != "APERTO":
+            continue
+        entry = pos["entry"]
+        # soglie
+        tp1_level = entry * (1 + Decimal(pos["tp1_pct"]) / Decimal(100))
+        tp2_level = entry * (1 + Decimal(pos["tp2_pct"]) / Decimal(100))
+        sl_level = entry * (1 + Decimal(pos["sl_pct"]) / Decimal(100))
 
-def manage_open_positions(price: float):
-    to_close = []
-    for p in open_positions:
-        sl_price = p.entry * (1.0 - p.sl_pct)
-        tp_price = p.entry * (1.0 + p.tp_pct)
-        if price <= sl_price:
-            to_close.append((p, "SL"))
-        elif price >= tp_price:
-            to_close.append((p, "TP"))
-    for p, reason in to_close:
-        close_position(p, price, reason)
+        if current_price <= sl_level:
+            close_position(pos, current_price, "SL")
+            open_positions.remove(pos)
+        elif current_price >= tp2_level:
+            close_position(pos, current_price, "TP2")
+            open_positions.remove(pos)
+        elif current_price >= tp1_level:
+            # parziale (per semplicità: chiude tutto alla prima che scatta)
+            close_position(pos, current_price, "TP1")
+            open_positions.remove(pos)
 
-# ===== MAIN =====
+
+# ================== MAIN LOOP ==================
 def main():
-    global cooldown_until, anchor_high
-    send_whatsapp("🤖 Bot Oro (WS only) avviato.")
-    ws_start()
+    global ws_thread
+    print("[BOOT] Bot Oro v3 – WS+Sheets+WA Meta")
 
-    last_ping = 0.0
-    last_report = 0.0
+    # init Sheets (crea/valida tabs & ping label)
+    global sheet
+    sheet = SheetLogger()
 
-    try:
-        while True:
-            now = time.time()
+    # avvia websocket
+    ws_thread = start_ws()
+    send_whatsapp("🤖 Bot Oro avviato (WS attivo).")
 
-            # Heartbeat con ultimo prezzo WS disponibile
-            if now - last_ping >= PING_EVERY:
-                px = get_price_ws()
-                if px is not None:
-                    sheet.heartbeat(price=px, msg="loop ok (ws-only)")
-                    print(f"[HEARTBEAT] {datetime.now()}  {SYMBOL}={px}")
-                else:
-                    print("[HEARTBEAT] prezzo non disponibile (in attesa dati WS)")
-                last_ping = now
+    last_open_ts = 0
+    open_every_sec = int(os.getenv("OPEN_EVERY_SEC", "0"))  # se >0 apertura periodica mock
 
-            px = get_price_ws()
-            if px is None:
-                time.sleep(0.5)
-                continue
-
-            # Cooldown / Operatività
-            if now < cooldown_until:
-                pass
+    while True:
+        try:
+            # heartbeat ogni HEARTBEAT_SEC
+            if latest_price is None:
+                print("[HEARTBEAT] prezzo non disponibile (in attesa WS)")
             else:
-                if not open_positions:
-                    if maybe_open(px):
-                        pass
-                else:
-                    manage_open_positions(px)
+                sheet.log_heartbeat(float(latest_price), msg="loop ok (ws-only)")
+                sheet.set_last_ping(f"{now_str()} · {latest_price}")
 
-                if not open_positions and anchor_high is None:
-                    cooldown_until = now + COOLDOWN_MIN * 60
-                    anchor_high = px
-                    send_whatsapp(f"⏸ Cooldown {COOLDOWN_MIN} min — equity {equity:.2f}")
+                # gestione posizioni
+                manage_positions(latest_price)
 
-            # Report leggero
-            if now - last_report >= REPORT_EVERY:
-                send_whatsapp(f"📊 Equity attuale: {equity:.2f} — posizioni aperte: {len(open_positions)}")
-                last_report = now
+                # apertura mock periodica (solo per test)
+                if open_every_sec > 0 and time.time() - last_open_ts > open_every_sec:
+                    open_position(latest_price, "LONG")
+                    last_open_ts = time.time()
 
-            time.sleep(0.2)
-    finally:
-        ws_stop()
+            time.sleep(HEARTBEAT_SEC)
+        except Exception as e:
+            print("[LOOP] ERRORE:", e)
+            time.sleep(5)
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        ws_stop.set()
+        if ws_thread and ws_thread.is_alive():
+            ws_thread.join(timeout=2)
