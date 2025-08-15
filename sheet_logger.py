@@ -104,42 +104,43 @@ class SheetLogger:
 
     # -------- Chiusura trade (TP1/TP2/SL/MANUALE) --------
     def log_close(self, *, trade_id: str, close_price: float, close_type: str,
-                  pnl_pct: float, pnl_value: float, equity_after: float, note: str = ""):
-        """
-        Completa la riga dell'apertura (se trovata). Se non trova l'apertura,
-        crea una riga 'CHIUSA' di fallback.
-        """
-        # cerca l'ultima riga con quel trade_id e Stato=APERTO
-        id_col = self.trade_ws.col_values(2)  # colonna B = "ID trade"
-        target_row = None
-        # scorri dal basso verso l'alto (ignorando header)
-        for i in range(len(id_col)-1, 1, -1):
-            if id_col[i-1] == trade_id:
-                stato = self.trade_ws.cell(i, 4).value  # col D = "Stato"
-                if str(stato).upper() == "APERTO":
-                    target_row = i
-                    break
+              pnl_pct: float, pnl_value: float, equity_after: float, note: str = ""):
+    """
+    Completa la riga dell'apertura (se trovata). Se non trova l'apertura,
+    crea una riga 'CHIUSA' di fallback.
+    """
+    # cerca l'ultima riga con quel trade_id e Stato=APERTO
+    id_col = self.trade_ws.col_values(2)  # colonna B = "ID trade"
+    target_row = None
+    for i in range(len(id_col)-1, 1, -1):
+        if id_col[i-1] == trade_id:
+            stato = self.trade_ws.cell(i, 4).value  # col D = "Stato"
+            if str(stato).upper() == "APERTO":
+                target_row = i
+                break
 
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        if target_row:
-            # J..N = Prezzo chiusura, Chiusura, P&L %, P&L valore, Equity post-trade
-            self.trade_ws.update(f"J{target_row}:N{target_row}", [[
-                close_price, close_type, pnl_pct, pnl_value, equity_after
-            ]])
-            self.trade_ws.update(f"D{target_row}", "CHIUSO")     # Stato
-            self.trade_ws.update(f"A{target_row}", now)          # Data/Ora (timestamp chiusura)
-            if note:
-                self.trade_ws.update(f"P{target_row}", note)     # Note
-        else:
-            # fallback: scrivi riga chiusa
-            row = {
-                "Data/Ora": now, "ID trade": trade_id, "Lato": "",
-                "Stato": "CHIUSO", "Prezzo ingresso": "", "Qty": "",
-                "SL %": "", "TP1 %": "", "TP2 %": "",
-                "Prezzo chiusura": close_price, "Chiusura": close_type,
-                "P&L %": pnl_pct, "P&L valore": pnl_value,
-                "Equity post-trade": equity_after,
-                "Strategia": "", "Note": f"(chiusura senza apertura) {note}".strip()
-            }
-            ordered = [row.get(h, "") for h in TRADE_HEADERS]
-            self.trade_ws.append_row(ordered, value_input_option="USER_ENTERED")
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    if target_row:
+        # J..N = Prezzo chiusura, Chiusura, P&L %, P&L valore, Equity post-trade
+        self.trade_ws.update(f"J{target_row}:N{target_row}", [[
+            close_price, close_type, pnl_pct, pnl_value, equity_after
+        ]])
+        # aggiornamenti a cella singola -> SEMPRE [[valore]]
+        self.trade_ws.update(f"D{target_row}", [["CHIUSO"]])  # Stato
+        self.trade_ws.update(f"A{target_row}", [[now]])       # Data/Ora (timestamp chiusura)
+        if note:
+            self.trade_ws.update(f"P{target_row}", [[note]])  # Note
+    else:
+        # fallback: scrivi riga chiusa
+        row = {
+            "Data/Ora": now, "ID trade": trade_id, "Lato": "",
+            "Stato": "CHIUSO", "Prezzo ingresso": "", "Qty": "",
+            "SL %": "", "TP1 %": "", "TP2 %": "",
+            "Prezzo chiusura": close_price, "Chiusura": close_type,
+            "P&L %": pnl_pct, "P&L valore": pnl_value,
+            "Equity post-trade": equity_after,
+            "Strategia": "", "Note": f"(chiusura senza apertura) {note}".strip()
+        }
+        ordered = [row.get(h, "") for h in TRADE_HEADERS]
+        self.trade_ws.append_row(ordered, value_input_option="USER_ENTERED")
