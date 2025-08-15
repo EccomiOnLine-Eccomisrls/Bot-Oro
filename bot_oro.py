@@ -1,26 +1,22 @@
-# bot_oro.py — v3 (WebSocket price + fallback REST ultra-throttle)
-import os, json, time, threading
+# bot_oro.py — v3.1 (Solo WebSocket, nessuna chiamata REST all'avvio)
+import os, time, threading
 from dataclasses import dataclass
 from datetime import datetime
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
-from binance.client import Client
 from binance import ThreadedWebsocketManager
 from twilio.rest import Client as TwilioClient
 from sheet_logger import SheetLogger
 
 # ===== ENV =====
-BINANCE_API_KEY    = os.getenv("BINANCE_API_KEY")
-BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
-SYMBOL             = os.getenv("BINANCE_SYMBOL", "PAXGUSDT")  # es. PAXGUSDT
+BINANCE_API_KEY    = os.getenv("BINANCE_API_KEY") or ""   # per stream pubblici non serve
+BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET") or ""
+SYMBOL             = os.getenv("BINANCE_SYMBOL", "PAXGUSDT").upper()
+
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN  = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886")
 DESTINATION_NUMBER     = os.getenv("TWILIO_TO", "whatsapp:+393205616977")
-SPREADSHEET_ID     = os.getenv("SPREADSHEET_ID")
-GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS")
 
-# Strategia (come prima)
+# Strategia
 ENTRY_DROP   = float(os.getenv("ENTRY_DROP", 0.005))
 SL_PCT       = float(os.getenv("STOP_LOSS", 0.005))
 TP1_PCT      = float(os.getenv("TAKE_PROFIT1", 0.004))
@@ -31,9 +27,7 @@ PING_EVERY   = int(os.getenv("PING_EVERY_SEC", "60"))
 REPORT_EVERY = int(os.getenv("REPORT_EVERY_SEC", "3600"))
 EQUITY_START = float(os.getenv("EQUITY_START", 10000.0))
 
-# ===== Connessioni di servizio =====
-# NB: il Client REST lo useremo solo come fallback, e con molta parsimonia
-rest_client   = Client(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
+# ===== Servizi =====
 twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 sheet         = SheetLogger()
 
@@ -43,28 +37,35 @@ def invia_msg(msg: str):
     except Exception as e:
         print("[WHATSAPP][ERR]", e)
 
-# ========== WebSocket Ticker ==========
+# ===== WebSocket Ticker =====
 latest_price = None
 latest_ts    = 0.0
 ws_lock      = threading.Lock()
 twm          = None
 
 def _on_msg(msg):
+    """Handler WS: aggiorna latest_price senza chiamare REST."""
     global latest_price, latest_ts
     try:
-        # ticker stream: 'c' = last price (stringa)
-        p = float(msg.get("c") or msg.get("p") or msg["data"]["c"])
-        with ws_lock:
-            latest_price = p
-            latest_ts = time.time()
+        # Formato python-binance: msg['c'] = last price (stringa)
+        p = None
+        if isinstance(msg, dict):
+            if 'c' in msg:           # format standard
+                p = msg['c']
+            elif 'data' in msg and 'c' in msg['data']:  # a volte incapsulato
+                p = msg['data']['c']
+        if p is not None:
+            with ws_lock:
+                latest_price = float(p)
+                latest_ts = time.time()
     except Exception as e:
         print("[WS][PARSE][ERR]", e)
 
 def ws_start():
+    """Avvia solo streaming pubblico; niente REST."""
     global twm
     twm = ThreadedWebsocketManager(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
     twm.start()
-    # stream singolo sul simbolo
     twm.start_symbol_ticker_socket(callback=_on_msg, symbol=SYMBOL)
 
 def ws_stop():
@@ -73,27 +74,16 @@ def ws_stop():
         twm.stop()
         twm = None
 
-def get_price_safe():
-    """Ritorna il prezzo da WS se recente; altrimenti 1 REST (throttle) e poi aspetta."""
-    global latest_price, latest_ts
+def get_price_ws(timeout_stale=30):
+    """Ritorna ultimo prezzo WS se non più vecchio di timeout_stale secondi."""
     now = time.time()
     with ws_lock:
-        lp = latest_price
-        lts = latest_ts
-    if lp is not None and (now - lts) <= 30:
+        lp, ts = latest_price, latest_ts
+    if lp is not None and (now - ts) <= timeout_stale:
         return lp
-    # Fallback REST: UNA sola richiesta, poi sleep per evitare ban
-    try:
-        px = float(rest_client.get_symbol_ticker(symbol=SYMBOL)["price"])
-        with ws_lock:
-            latest_price = px
-            latest_ts = time.time()
-        return px
-    except Exception as e:
-        print("[REST][ERR]", e)
-        return None
+    return None
 
-# ============ Modello posizione & logica (come v2) ============
+# ===== Modello posizione & logica =====
 @dataclass
 class Position:
     trade_id: str
@@ -139,9 +129,8 @@ def log_open_pair(entry: float):
 
 def close_position(p: Position, close_price: float, reason: str):
     global equity, open_positions
-    direction = 1
-    pnl_value = (close_price - p.entry) * p.qty * direction
-    pnl_pct   = ((close_price - p.entry) / p.entry) * 100.0 * direction
+    pnl_value = (close_price - p.entry) * p.qty
+    pnl_pct   = ((close_price - p.entry) / p.entry) * 100.0
     equity   += pnl_value
     sheet.log_close(trade_id=p.trade_id, close_price=close_price, close_type=reason,
                     pnl_pct=round(pnl_pct, 4), pnl_value=round(pnl_value, 2),
@@ -176,12 +165,10 @@ def manage_open_positions(price: float):
     for p, reason in to_close:
         close_position(p, price, reason)
 
-# ============ MAIN ============
+# ===== MAIN =====
 def main():
     global cooldown_until, anchor_high
-    invia_msg("🤖 Bot Oro (WS) avviato — niente polling REST.")
-
-    # avvia WebSocket
+    invia_msg("🤖 Bot Oro (WS only) avviato — nessuna chiamata REST.")
     ws_start()
 
     last_ping = 0.0
@@ -191,23 +178,23 @@ def main():
         while True:
             now = time.time()
 
-            # Heartbeat (usa l'ultimo prezzo noto, se c'è)
+            # Heartbeat con ultimo prezzo WS disponibile
             if now - last_ping >= PING_EVERY:
-                px = latest_price
+                px = get_price_ws()
                 if px is not None:
-                    sheet.heartbeat(price=px, msg="loop ok (ws)")
+                    sheet.heartbeat(price=px, msg="loop ok (ws-only)")
                     print(f"[HEARTBEAT] {datetime.now()}  {SYMBOL}={px}")
                 else:
-                    print("[HEARTBEAT] prezzo non disponibile (ws connecting)")
+                    print("[HEARTBEAT] prezzo non disponibile (in attesa dati WS)")
                 last_ping = now
 
-            # Prezzo corrente (WS o fallback sporadico)
-            px = get_price_safe()
+            # Prezzo corrente da WS
+            px = get_price_ws()
             if px is None:
-                time.sleep(2)
+                time.sleep(0.5)  # aspetta lo stream, niente REST
                 continue
 
-            # Cooldown o operatività
+            # Cooldown / Operatività
             if now < cooldown_until:
                 pass
             else:
@@ -222,13 +209,12 @@ def main():
                     anchor_high = px
                     invia_msg(f"⏸ Cooldown {COOLDOWN_MIN} min — equity {equity:.2f}")
 
-            # Report (leggero)
+            # Report leggero
             if now - last_report >= REPORT_EVERY:
                 invia_msg(f"📊 Equity attuale: {equity:.2f} — posizioni aperte: {len(open_positions)}")
                 last_report = now
 
-            time.sleep(0.5)  # loop leggero; WS fornisce i tick
-
+            time.sleep(0.2)
     finally:
         ws_stop()
 
