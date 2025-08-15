@@ -1,95 +1,140 @@
 # bot_oro.py
-# Bot Oro – v3 (WS Binance + Google Sheet + WhatsApp Cloud API)
-# - WebSocket puro su Binance (niente REST quota)
+# Bot Oro – v3 (WS Binance + Google Sheet + Telegram + WhatsApp Cloud API)
+# - Prezzo via WebSocket pubblico Binance (no REST, no ban)
 # - Log su Google Sheets (SheetLogger)
-# - Alert via WhatsApp Cloud API (wa_meta.py) con fallback interno
-# - Strategia mock per test: apre/chiude operazioni su TP1/TP2/SL
+# - Notifiche Telegram sempre disponibili (gratis)
+# - Notifiche WhatsApp via Meta Cloud API opzionali (quando attive)
+# - Strategia mock per test: apre/chiude operazioni con TP1/TP2/SL
 
 import os
 import json
 import time
 import asyncio
 import threading
-import websockets
 from datetime import datetime
 from decimal import Decimal
 
-# ===== Sheets =====
-from sheet_logger import SheetLogger  # deve essere nel repo
+import websockets
+import requests
 
-# ===== WhatsApp (Meta Cloud API) =====
-try:
-    from wa_meta import MetaWhatsApp  # preferito
-except Exception:
-    import requests
-
-    class MetaWhatsApp:
-        def __init__(self, token=None, phone_id=None, default_to=None, timeout=15):
-            self.token = token or os.getenv("WA_TOKEN", "")
-            self.phone_id = phone_id or os.getenv("WA_PHONE_ID", "")
-            self.default_to = default_to or os.getenv("WA_TO", "")
-            self.timeout = timeout
-            if not self.token or not self.phone_id:
-                raise ValueError("WA_TOKEN o WA_PHONE_ID mancanti per WhatsApp Cloud API.")
-            self.base_url = f"https://graph.facebook.com/v20.0/{self.phone_id}/messages"
-            self.headers = {"Authorization": f"Bearer {self.token}"}
-
-        def send_text(self, body: str, to: str | None = None) -> dict:
-            to = (to or self.default_to or "").strip()
-            if not to:
-                raise ValueError("Numero destinatario mancante (WA_TO). Usa solo cifre, senza +.")
-            payload = {
-                "messaging_product": "whatsapp",
-                "to": to,
-                "type": "text",
-                "text": {"preview_url": False, "body": body},
-            }
-            r = requests.post(self.base_url, headers=self.headers, json=payload, timeout=self.timeout)
-            r.raise_for_status()
-            return r.json()
+# ===== Google Sheets =====
+from sheet_logger import SheetLogger  # Assicurati che sia presente nel repo
 
 # ================== CONFIG ==================
-ALERTS_ENABLED = os.getenv("ALERTS_ENABLED", "true").lower() == "true"
-WA_PROVIDER = os.getenv("WA_PROVIDER", "meta").lower()  # meta | (altro: non usato)
+# Symbol per stream WS (minuscolo, formato binance spot)
+SYMBOL = os.getenv("SYMBOL", "paxgusdt").lower()
 
-SYMBOL = os.getenv("SYMBOL", "paxgusdt").lower()  # stream WS
+# Heartbeat (secondi fra un ciclo e l'altro)
 HEARTBEAT_SEC = int(os.getenv("HEARTBEAT_SEC", "60"))
 
-TRADE_SIZE = Decimal(os.getenv("TRADE_SIZE", "0.001"))  # quantità fittizia per test
-STOP_LOSS = Decimal(os.getenv("STOP_LOSS", "-0.5"))
-TP1 = Decimal(os.getenv("TAKE_PROFIT1", "0.2"))
-TP2 = Decimal(os.getenv("TAKE_PROFIT2", "0.4"))
+# Parametri strategia (mock per test)
+TRADE_SIZE = Decimal(os.getenv("TRADE_SIZE", "0.001"))  # quantità fittizia
+STOP_LOSS = Decimal(os.getenv("STOP_LOSS", "-0.5"))     # -0.5% default
+TP1       = Decimal(os.getenv("TAKE_PROFIT1", "0.2"))   # +0.2% default
+TP2       = Decimal(os.getenv("TAKE_PROFIT2", "0.4"))   # +0.4% default
 STRATEGY_TAG = os.getenv("STRATEGY_TAG", "v1")
+OPEN_EVERY_SEC = int(os.getenv("OPEN_EVERY_SEC", "0"))  # se >0 apre un trade fittizio ogni N sec
 
-# ================== GLOBAL STATE ==================
+# Telegram (consigliato, gratis)
+TELEGRAM_ENABLED   = os.getenv("TELEGRAM_ENABLED", "true").lower() == "true"
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
+
+# WhatsApp (Meta Cloud API) - opzionale
+ALERTS_ENABLED = os.getenv("ALERTS_ENABLED", "false").lower() == "true"  # abilita canale WA
+WA_PROVIDER    = os.getenv("WA_PROVIDER", "meta").lower()                # per ora supportiamo solo "meta"
+WA_TOKEN       = os.getenv("WA_TOKEN", "")
+WA_PHONE_ID    = os.getenv("WA_PHONE_ID", "")
+WA_TO          = (os.getenv("WA_TO", "") or "").strip()  # numero solo cifre (es. 39320...)
+
+# ================== STATO GLOBALE ==================
 latest_price: Decimal | None = None
 price_ts: float | None = None
 ws_thread: threading.Thread | None = None
 ws_stop = threading.Event()
 
-open_positions = []  # lista di dict: {id, side, entry, qty, sl_pct, tp1_pct, tp2_pct, state}
+# lista di posizioni aperte (mock)
+# ogni posizione: {id, side, entry, qty, sl_pct, tp1_pct, tp2_pct, state}
+open_positions: list[dict] = []
 
-# ================== HELPERS ==================
+# ================== UTILS ==================
 def now_str():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def send_whatsapp(msg: str):
+# ================== NOTIFIER: TELEGRAM ==================
+def send_telegram_message(text: str):
+    """Invia un messaggio su Telegram se configurato."""
+    if not TELEGRAM_ENABLED:
+        return
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[TELEGRAM] Config mancante (BOT_TOKEN/CHAT_ID).")
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
+    try:
+        r = requests.post(url, json=payload, timeout=15)
+        if r.status_code != 200:
+            print(f"[TELEGRAM ERROR] {r.status_code} - {r.text}")
+        else:
+            print("[TELEGRAM] OK")
+    except Exception as e:
+        print("[TELEGRAM EXC]", e)
+
+
+# ================== NOTIFIER: WHATSAPP META (opzionale) ==================
+def send_whatsapp_meta(text: str):
+    """Invia un messaggio WhatsApp tramite Meta Cloud API (se abilitato)."""
     if not ALERTS_ENABLED:
         return
+    if WA_PROVIDER != "meta":
+        print("[WA] Provider non supportato (usa 'meta').")
+        return
+    if not WA_TOKEN or not WA_PHONE_ID or not WA_TO:
+        print("[WA] Config mancante (WA_TOKEN / WA_PHONE_ID / WA_TO).")
+        return
+
+    # WA_TO deve essere solo cifre (senza +); Meta accetta anche con + ma teniamo standard solo cifre.
+    to = WA_TO
+    if to.startswith("+"):
+        to = to[1:]
+
+    url = f"https://graph.facebook.com/v20.0/{WA_PHONE_ID}/messages"
+    headers = {"Authorization": f"Bearer {WA_TOKEN}"}
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "text",
+        "text": {"preview_url": False, "body": text},
+    }
     try:
-        if WA_PROVIDER != "meta":
-            print("[WA] Provider non supportato, salta invio.")
-            return
-        MetaWhatsApp().send_text(msg)
-        print("[WA] OK:", msg[:100])
+        r = requests.post(url, headers=headers, json=payload, timeout=20)
+        if r.status_code != 200:
+            print(f"[WA META ERROR] {r.status_code} - {r.text}")
+        else:
+            print("[WA META] OK")
     except Exception as e:
-        print("[WA] ERRORE:", e)
+        print("[WA META EXC]", e)
 
 
-# ================== WEBSOCKET LISTENER ==================
+# ================== NOTIFY ALL (Telegram + WhatsApp) ==================
+def notify_all(msg: str):
+    """Invia il messaggio su tutti i canali attivi."""
+    # Prima Telegram (affidabile e gratis)
+    try:
+        send_telegram_message(msg)
+    except Exception as e:
+        print("[NOTIFY][TG] ERR", e)
+    # Poi WhatsApp (se abilitato e configurato)
+    try:
+        send_whatsapp_meta(msg)
+    except Exception as e:
+        print("[NOTIFY][WA] ERR", e)
+
+
+# ================== WEBSOCKET LISTENER (BINANCE) ==================
 async def price_stream(symbol: str):
-    """Apre un WS su stream pubblici Binance e aggiorna latest_price."""
+    """Apre WS pubblico Binance e aggiorna latest_price a ogni trade."""
     global latest_price, price_ts
     stream_url = f"wss://stream.binance.com:9443/ws/{symbol}@trade"
     backoff = 1
@@ -98,20 +143,22 @@ async def price_stream(symbol: str):
             async with websockets.connect(stream_url, ping_interval=20, ping_timeout=20) as ws:
                 print(f"[WS] Connesso a {stream_url}")
                 backoff = 1
-                async for msg in ws:
+                async for raw in ws:
                     if ws_stop.is_set():
                         break
-                    data = json.loads(msg)
-                    # prezzo trade: "p" come stringa
-                    p = Decimal(data.get("p"))
-                    latest_price = p
+                    data = json.loads(raw)
+                    # Prezzo del trade in campo "p" (stringa)
+                    p_str = data.get("p")
+                    if p_str is None:
+                        continue
+                    latest_price = Decimal(p_str)
                     price_ts = time.time()
         except Exception as e:
             print("[WS] Disconnesso/errore:", e)
             if ws_stop.is_set():
                 break
             time.sleep(backoff)
-            backoff = min(backoff * 2, 30)  # exponential backoff max 30s
+            backoff = min(backoff * 2, 30)  # backoff max 30s
 
 
 def start_ws():
@@ -123,9 +170,10 @@ def start_ws():
     t.start()
     return t
 
-# ================== TRADING MOCK LOGIC ==================
+
+# ================== TRADING MOCK ==================
 def open_position(price: Decimal, side: str = "LONG"):
-    """Apre un trade fittizio e lo registra su Sheet."""
+    """Apre un trade fittizio e lo registra su Sheets."""
     trade_id = f"PAXGUSDT-{int(time.time()*1000)}"
     pos = {
         "id": trade_id,
@@ -139,7 +187,7 @@ def open_position(price: Decimal, side: str = "LONG"):
     }
     open_positions.append(pos)
 
-    # log su sheet
+    # Log su Google Sheet
     sheet.log_open(
         trade_id=trade_id,
         side=side,
@@ -151,17 +199,27 @@ def open_position(price: Decimal, side: str = "LONG"):
         strategy=STRATEGY_TAG,
         note="apertura mock"
     )
-    send_whatsapp(f"🚀 APERTURA {side}\nID: {trade_id}\nEntry: {price}\nTP1 {TP1}% · TP2 {TP2}% · SL {STOP_LOSS}%")
+
+    notify_all(
+        f"🚀 APERTURA {side}\n"
+        f"ID: {trade_id}\n"
+        f"Entry: {price}\n"
+        f"TP1 {TP1}% · TP2 {TP2}% · SL {STOP_LOSS}%"
+    )
     print("[TRADE] OPEN", pos)
 
 
 def close_position(pos: dict, close_price: Decimal, reason: str):
-    """Chiude trade fittizio e aggiorna Sheet."""
+    """Chiude trade fittizio e aggiorna Sheets."""
     if pos.get("state") != "APERTO":
         return
     pos["state"] = "CHIUSO"
-    pnl_pct = float(((close_price - pos["entry"]) / pos["entry"]) * 100) if pos["side"] == "LONG" \
-        else float(((pos["entry"] - close_price) / pos["entry"]) * 100)
+
+    if pos["side"] == "LONG":
+        pnl_pct = float(((close_price - pos["entry"]) / pos["entry"]) * 100)
+    else:
+        pnl_pct = float(((pos["entry"] - close_price) / pos["entry"]) * 100)
+
     pnl_value = float(Decimal(pnl_pct) / Decimal(100) * Decimal(pos["qty"]) * close_price)
 
     sheet.log_close(
@@ -170,10 +228,16 @@ def close_position(pos: dict, close_price: Decimal, reason: str):
         close_type=reason,
         pnl_pct=round(pnl_pct, 4),
         pnl_value=round(pnl_value, 2),
-        equity_after="",  # opzionale: se vuoi calcolare l'equity cumulata
+        equity_after="",  # opzionale: puoi calcolare equity cumulata
         note=reason
     )
-    send_whatsapp(f"✅ CHIUSURA ({reason})\nID: {pos['id']}\nClose: {close_price}\nPnL: {pnl_pct:.3f}%")
+
+    notify_all(
+        f"✅ CHIUSURA ({reason})\n"
+        f"ID: {pos['id']}\n"
+        f"Close: {close_price}\n"
+        f"PnL: {pnl_pct:.3f}%"
+    )
     print("[TRADE] CLOSE", pos["id"], reason)
 
 
@@ -183,10 +247,9 @@ def manage_positions(current_price: Decimal):
         if pos["state"] != "APERTO":
             continue
         entry = pos["entry"]
-        # soglie
         tp1_level = entry * (1 + Decimal(pos["tp1_pct"]) / Decimal(100))
         tp2_level = entry * (1 + Decimal(pos["tp2_pct"]) / Decimal(100))
-        sl_level = entry * (1 + Decimal(pos["sl_pct"]) / Decimal(100))
+        sl_level  = entry * (1 + Decimal(pos["sl_pct"])  / Decimal(100))
 
         if current_price <= sl_level:
             close_position(pos, current_price, "SL")
@@ -195,41 +258,40 @@ def manage_positions(current_price: Decimal):
             close_position(pos, current_price, "TP2")
             open_positions.remove(pos)
         elif current_price >= tp1_level:
-            # parziale (per semplicità: chiude tutto alla prima che scatta)
+            # Parziale semplice: per il mock chiudiamo tutto al primo target
             close_position(pos, current_price, "TP1")
             open_positions.remove(pos)
 
 
 # ================== MAIN LOOP ==================
 def main():
-    global ws_thread
-    print("[BOOT] Bot Oro v3 – WS+Sheets+WA Meta")
+    global ws_thread, sheet
+    print("[BOOT] Bot Oro v3 – WS+Sheets+TG(+WA)")
 
-    # init Sheets (crea/valida tabs & ping label)
-    global sheet
+    # Inizializza Google Sheets (crea/valida tabs & ping label)
     sheet = SheetLogger()
 
-    # avvia websocket
+    # Avvia il WebSocket
     ws_thread = start_ws()
-    send_whatsapp("🤖 Bot Oro avviato (WS attivo).")
+
+    notify_all("🤖 Bot Oro avviato (WS attivo).")
 
     last_open_ts = 0
-    open_every_sec = int(os.getenv("OPEN_EVERY_SEC", "0"))  # se >0 apertura periodica mock
 
     while True:
         try:
-            # heartbeat ogni HEARTBEAT_SEC
             if latest_price is None:
                 print("[HEARTBEAT] prezzo non disponibile (in attesa WS)")
             else:
+                # Log heartbeat su Sheet + label 'Ultimo ping'
                 sheet.log_heartbeat(float(latest_price), msg="loop ok (ws-only)")
                 sheet.set_last_ping(f"{now_str()} · {latest_price}")
 
-                # gestione posizioni
+                # Gestione posizioni (TP/SL)
                 manage_positions(latest_price)
 
-                # apertura mock periodica (solo per test)
-                if open_every_sec > 0 and time.time() - last_open_ts > open_every_sec:
+                # Apertura mock periodica per test (se configurata)
+                if OPEN_EVERY_SEC > 0 and time.time() - last_open_ts > OPEN_EVERY_SEC:
                     open_position(latest_price, "LONG")
                     last_open_ts = time.time()
 
