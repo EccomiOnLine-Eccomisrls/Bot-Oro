@@ -1,4 +1,4 @@
-# bot_oro.py — v3.1 (Solo WebSocket, nessuna chiamata REST all'avvio)
+# bot_oro.py — WS only + ALERTS_ENABLED
 import os, time, threading
 from dataclasses import dataclass
 from datetime import datetime
@@ -7,14 +7,14 @@ from twilio.rest import Client as TwilioClient
 from sheet_logger import SheetLogger
 
 # ===== ENV =====
-BINANCE_API_KEY    = os.getenv("BINANCE_API_KEY") or ""   # per stream pubblici non serve
-BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET") or ""
-SYMBOL             = os.getenv("BINANCE_SYMBOL", "PAXGUSDT").upper()
+SYMBOL = os.getenv("BINANCE_SYMBOL", "PAXGUSDT").upper()
 
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN  = os.getenv("TWILIO_AUTH_TOKEN")
+# Twilio / Alerts
+TWILIO_ACCOUNT_SID     = os.getenv("TWILIO_ACCOUNT_SID", "")
+TWILIO_AUTH_TOKEN      = os.getenv("TWILIO_AUTH_TOKEN", "")
 TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886")
-DESTINATION_NUMBER     = os.getenv("TWILIO_TO", "whatsapp:+393205616977")
+TWILIO_TO              = os.getenv("TWILIO_TO", "")
+ALERTS_ENABLED         = os.getenv("ALERTS_ENABLED", "true").lower() == "true"
 
 # Strategia
 ENTRY_DROP   = float(os.getenv("ENTRY_DROP", 0.005))
@@ -28,12 +28,19 @@ REPORT_EVERY = int(os.getenv("REPORT_EVERY_SEC", "3600"))
 EQUITY_START = float(os.getenv("EQUITY_START", 10000.0))
 
 # ===== Servizi =====
-twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-sheet         = SheetLogger()
+twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) if (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN) else None
+sheet = SheetLogger()
 
-def invia_msg(msg: str):
+def send_whatsapp(text: str):
+    if not ALERTS_ENABLED:
+        print("[WHATSAPP] Disattivato (ALERTS_ENABLED=false).", text)
+        return
+    if not twilio_client or not TWILIO_TO:
+        print("[WHATSAPP] Config mancante, salto invio.", text)
+        return
     try:
-        twilio_client.messages.create(body=msg, from_=TWILIO_WHATSAPP_NUMBER, to=DESTINATION_NUMBER)
+        twilio_client.messages.create(body=text, from_=TWILIO_WHATSAPP_NUMBER, to=TWILIO_TO)
+        print("[WHATSAPP] Inviato.")
     except Exception as e:
         print("[WHATSAPP][ERR]", e)
 
@@ -44,16 +51,12 @@ ws_lock      = threading.Lock()
 twm          = None
 
 def _on_msg(msg):
-    """Handler WS: aggiorna latest_price senza chiamare REST."""
     global latest_price, latest_ts
     try:
-        # Formato python-binance: msg['c'] = last price (stringa)
         p = None
         if isinstance(msg, dict):
-            if 'c' in msg:           # format standard
-                p = msg['c']
-            elif 'data' in msg and 'c' in msg['data']:  # a volte incapsulato
-                p = msg['data']['c']
+            if 'c' in msg: p = msg['c']
+            elif 'data' in msg and 'c' in msg['data']: p = msg['data']['c']
         if p is not None:
             with ws_lock:
                 latest_price = float(p)
@@ -62,9 +65,8 @@ def _on_msg(msg):
         print("[WS][PARSE][ERR]", e)
 
 def ws_start():
-    """Avvia solo streaming pubblico; niente REST."""
     global twm
-    twm = ThreadedWebsocketManager(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
+    twm = ThreadedWebsocketManager()
     twm.start()
     twm.start_symbol_ticker_socket(callback=_on_msg, symbol=SYMBOL)
 
@@ -75,7 +77,6 @@ def ws_stop():
         twm = None
 
 def get_price_ws(timeout_stale=30):
-    """Ritorna ultimo prezzo WS se non più vecchio di timeout_stale secondi."""
     now = time.time()
     with ws_lock:
         lp, ts = latest_price, latest_ts
@@ -125,7 +126,10 @@ def log_open_pair(entry: float):
                    sl_pct=SL_PCT, tp1_pct=TP1_PCT, tp2_pct=TP2_PCT, strategy="v1", note="TP2")
     open_positions.append(Position(trade_id_b, "LONG", entry, qty_half, TP2_PCT, SL_PCT, time.time()))
 
-    invia_msg(f"🟢 APERTI {SYMBOL}\nEntry {entry:.2f}\nQty tot {qty_half*2:.6f}\nSL {SL_PCT*100:.2f}%  TP1 {TP1_PCT*100:.2f}%  TP2 {TP2_PCT*100:.2f}%")
+    send_whatsapp(
+        f"🟢 APERTI {SYMBOL}\nEntry {entry:.2f}\nQty tot {qty_half*2:.6f}\n"
+        f"SL {SL_PCT*100:.2f}% · TP1 {TP1_PCT*100:.2f}% · TP2 {TP2_PCT*100:.2f}%"
+    )
 
 def close_position(p: Position, close_price: float, reason: str):
     global equity, open_positions
@@ -135,7 +139,11 @@ def close_position(p: Position, close_price: float, reason: str):
     sheet.log_close(trade_id=p.trade_id, close_price=close_price, close_type=reason,
                     pnl_pct=round(pnl_pct, 4), pnl_value=round(pnl_value, 2),
                     equity_after=round(equity, 2), note=reason)
-    invia_msg(f"⚪️ CHIUSO {p.trade_id} {reason}\nEntry {p.entry:.2f} → Close {close_price:.2f}\nP&L {pnl_pct:.3f}%  ({pnl_value:.2f})\nEquity {equity:.2f}")
+    send_whatsapp(
+        f"⚪️ CHIUSO {p.trade_id} {reason}\n"
+        f"Entry {p.entry:.2f} → Close {close_price:.2f}\n"
+        f"P&L {pnl_pct:.3f}%  ({pnl_value:.2f})\nEquity {equity:.2f}"
+    )
     open_positions = [x for x in open_positions if x.trade_id != p.trade_id]
 
 def maybe_open(price: float):
@@ -168,7 +176,7 @@ def manage_open_positions(price: float):
 # ===== MAIN =====
 def main():
     global cooldown_until, anchor_high
-    invia_msg("🤖 Bot Oro (WS only) avviato — nessuna chiamata REST.")
+    send_whatsapp("🤖 Bot Oro (WS only) avviato.")
     ws_start()
 
     last_ping = 0.0
@@ -188,10 +196,9 @@ def main():
                     print("[HEARTBEAT] prezzo non disponibile (in attesa dati WS)")
                 last_ping = now
 
-            # Prezzo corrente da WS
             px = get_price_ws()
             if px is None:
-                time.sleep(0.5)  # aspetta lo stream, niente REST
+                time.sleep(0.5)
                 continue
 
             # Cooldown / Operatività
@@ -207,11 +214,11 @@ def main():
                 if not open_positions and anchor_high is None:
                     cooldown_until = now + COOLDOWN_MIN * 60
                     anchor_high = px
-                    invia_msg(f"⏸ Cooldown {COOLDOWN_MIN} min — equity {equity:.2f}")
+                    send_whatsapp(f"⏸ Cooldown {COOLDOWN_MIN} min — equity {equity:.2f}")
 
             # Report leggero
             if now - last_report >= REPORT_EVERY:
-                invia_msg(f"📊 Equity attuale: {equity:.2f} — posizioni aperte: {len(open_positions)}")
+                send_whatsapp(f"📊 Equity attuale: {equity:.2f} — posizioni aperte: {len(open_positions)}")
                 last_report = now
 
             time.sleep(0.2)
