@@ -1,200 +1,148 @@
 # bot_oro.py
-# ------------------------------------------------------------
-# BOT ORO – heartbeat + logging + notifiche Telegram
-# Timezone allineata (Europe/Rome) e integrazione Google Sheet.
-# ------------------------------------------------------------
+# --------------------------------------------
+# BOT ORO – Monitor + Log + Notifiche (WS-only)
+# --------------------------------------------
 
 import os
 import json
 import time
-from datetime import datetime
-import pytz
 import requests
+from datetime import datetime, timezone, timedelta
 
-# Google Sheets
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
-# opzionale: python-binance (per future estensioni/trading)
-try:
-    from binance.client import Client as BinanceClient
-except Exception:
-    BinanceClient = None
+# ========= Config base =========
+SYMBOL = "PAXGUSDT"              # Oro tokenizzato su Binance
+HEARTBEAT_SECS = 60              # frequenza heartbeat / refresh "Ultimo ping"
 
+# Foglio Google: usa variabile d'ambiente GOOGLE_CREDENTIALS (JSON) oppure file locale
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")  # obbligatoria
 
-# =========[ Config da ENV ]==================================
+# Telegram (opzionale ma consigliato)
+TG_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # es. "203729322"
 
-SPREADSHEET_ID        = os.getenv("SPREADSHEET_ID", "").strip()
-GOOGLE_CREDENTIALS    = os.getenv("GOOGLE_CREDENTIALS", "").strip()
+# Fuso orario Italia (CET/CEST) per timestamp leggibili
+TZ_ITALY = timezone(timedelta(hours=2))  # in estate UTC+2; se vuoi auto-DST usa pytz
 
-TELEGRAM_BOT_TOKEN    = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID      = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+# ========= Utility orario =========
+def now_str():
+    # Timestamp compatibile con quanto vedi nei tuoi screenshot
+    return datetime.now(TZ_ITALY).strftime("%Y-%m-%d %H:%M:%S")
 
-SYMBOL                = os.getenv("SYMBOL", "PAXGUSDT").upper().strip()
-HEARTBEAT_SEC         = int(os.getenv("HEARTBEAT_SEC", "60"))
+# ========= Notifiche =========
+def notify_telegram(text: str):
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+        payload = {"chat_id": TG_CHAT_ID, "text": text}
+        requests.post(url, json=payload, timeout=10)
+    except Exception:
+        # Non interrompe il bot se Telegram è giù
+        pass
 
-# dove scriviamo l’“Ultimo ping” nel foglio Trade
-TRADE_SHEET_NAME      = os.getenv("TRADE_SHEET_NAME", "Trade")
-TRADE_LASTPING_CELL   = os.getenv("TRADE_LASTPING_CELL", "K2")  # colonna “Ultimo ping” (screenshot)
-
-LOG_SHEET_NAME        = os.getenv("LOG_SHEET_NAME", "Log")
-
-# timezone unica e coerente
-TZ = pytz.timezone("Europe/Rome")
-
-
-def now_str() -> str:
-    """Ritorna l’ora corrente già convertita in Europe/Rome e formattata."""
-    return datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
-
-
-# =========[ Notifiche Telegram ]=============================
-
-class TelegramNotifier:
-    def __init__(self, token: str, chat_id: str):
-        self.token = token
-        self.chat_id = chat_id
-        self.base = f"https://api.telegram.org/bot{self.token}"
-
-    def enabled(self) -> bool:
-        return bool(self.token and self.chat_id)
-
-    def send(self, text: str) -> None:
-        if not self.enabled():
-            return
-        try:
-            r = requests.post(
-                f"{self.base}/sendMessage",
-                json={"chat_id": self.chat_id, "text": text}
-            )
-            r.raise_for_status()
-        except Exception as e:
-            # niente raise: non blocchiamo il bot per un problema di notifica
-            print(f"[TELEGRAM] errore invio: {e}")
-
-    # helper semantici
-    def info(self, text: str):  self.send(f"ℹ️ {text}")
-    def ok(self, text: str):    self.send(f"✅ {text}")
-    def warn(self, text: str):  self.send(f"⚠️ {text}")
-    def err(self, text: str):   self.send(f"❌ {text}")
-
-
-# =========[ Google Sheet logger ]============================
-
+# ========= Google Sheets =========
 class SheetLogger:
-    """
-    Scrive su:
-      - Foglio Log: righe [Data/Ora, Livello, Messaggio, Sorgente]
-      - Foglio Trade: cella 'Ultimo ping' (ad es. K2)
-    """
-    def __init__(self, creds_json_str: str, spreadsheet_id: str):
-        if not creds_json_str:
-            raise RuntimeError("GOOGLE_CREDENTIALS mancante.")
+    def __init__(self, spreadsheet_id: str):
         if not spreadsheet_id:
-            raise RuntimeError("SPREADSHEET_ID mancante.")
+            raise RuntimeError("SPREADSHEET_ID mancante")
 
         scope = [
             "https://spreadsheets.google.com/feeds",
             "https://www.googleapis.com/auth/drive",
         ]
 
+        creds = None
+        raw = os.getenv("GOOGLE_CREDENTIALS")
+        if raw:
+            try:
+                creds_dict = json.loads(raw)
+                creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+            except Exception as e:
+                raise RuntimeError(f"GOOGLE_CREDENTIALS non è un JSON valido: {e}")
+        else:
+            # fallback a file locale se preferisci
+            fname = "google_credentials.json"
+            if not os.path.exists(fname):
+                raise RuntimeError("Credenziali Google mancanti (env GOOGLE_CREDENTIALS o file google_credentials.json).")
+            creds = ServiceAccountCredentials.from_json_keyfile_name(fname, scope)
+
+        client = gspread.authorize(creds)
+        self.sheet = client.open_by_key(spreadsheet_id)
+        # Caching dei worksheet
+        self.ws_log = self.sheet.worksheet("Log")
+        self.ws_trade = self.sheet.worksheet("Trade")
+
+    def log(self, level: str, message: str, extra: str = "bot"):
+        """Scrive una riga su Log: [Data/Ora, Livello, Messaggio, Note]"""
         try:
-            creds_dict = json.loads(creds_json_str)
-        except json.JSONDecodeError:
-            raise RuntimeError(
-                "GOOGLE_CREDENTIALS non è un JSON valido. "
-                "Verifica le \\n nella private_key."
+            self.ws_log.append_row(
+                [now_str(), level, message, extra],
+                value_input_option="USER_ENTERED"
             )
-
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-        gc = gspread.authorize(creds)
-        self.ss = gc.open_by_key(spreadsheet_id)
-
-        # cache worksheet
-        self.ws_log = self.ss.worksheet(LOG_SHEET_NAME)
-        self.ws_trade = self.ss.worksheet(TRADE_SHEET_NAME)
-
-    def _append_log(self, level: str, message: str, source: str = "bot"):
-        row = [now_str(), level, message, source]
-        self.ws_log.append_row(row, value_input_option="USER_ENTERED")
-
-    def info(self, message: str, source: str = "bot"):
-        self._append_log("INFO", message, source)
-
-    def error(self, message: str, source: str = "bot"):
-        self._append_log("ERRORE", message, source)
-
-    def heartbeat(self, price: float):
-        """
-        Scrive:
-          - Log: "Heartbeat OK – {price}"
-          - Trade!K2 (o cella configurata): "{timestamp} – {price}"
-        """
-        ts = now_str()
-        msg = f"Heartbeat OK – {price}"
-        self._append_log("INFO", msg, "bot")
-
-        # Aggiorna “Ultimo ping”
-        try:
-            self.ws_trade.update(TRADE_LASTPING_CELL, f"{ts} – {price}")
         except Exception as e:
-            # non bloccare il loop se la update singola fallisce
-            self._append_log("ERRORE", f"Aggiornamento Ultimo ping fallito: {e}", "bot")
+            # Ultimo fallback: niente crash
+            print(f"[ERRORE] Scrittura Log fallita: {e}")
 
+    def log_heartbeat(self, price: float | None):
+        msg = "Heartbeat OK" if price is None else f"Heartbeat OK – {price:.2f}"
+        self.log("INFO", msg, "bot")
 
-# =========[ Price feed ]=====================================
+    def update_last_ping(self, price: float):
+        """Aggiorna Trade!K2 con 'YYYY-mm-dd HH:MM:SS – prezzo'."""
+        try:
+            text = f"{now_str()} - {price:.2f}"
+            # fix definitivo: usare update_acell / update_cell (non 'update' con "K2" nei values)
+            self.ws_trade.update_acell("K2", text)
+        except Exception as e:
+            self.log("ERRORE", f"Aggiornamento Ultimo ping fallito: {e}", "bot")
 
-def fetch_price(symbol: str) -> float:
-    """
-    Ritorna l'ultimo prezzo come float.
-    - Prima prova tramite endpoint pubblico Binance (ticker price)
-    - In caso di problemi, rilancia l’eccezione
-    """
-    # REST pubblico (nessuna API key richiesta)
-    url = "https://api.binance.com/api/v3/ticker/price"
+# ========= Prezzo =========
+def get_price_binance(symbol: str) -> float | None:
+    """Ritorna ultimo prezzo da Binance REST. None se non disponibile."""
     try:
-        r = requests.get(url, params={"symbol": symbol}, timeout=5)
+        r = requests.get(
+            "https://api.binance.com/api/v3/ticker/price",
+            params={"symbol": symbol},
+            timeout=10,
+        )
         r.raise_for_status()
         data = r.json()
-        price = float(data["price"])
-        return price
-    except Exception as e:
-        raise RuntimeError(f"Impossibile ottenere prezzo {symbol}: {e}")
+        return float(data["price"])
+    except Exception:
+        return None
 
-
-# =========[ Main loop ]======================================
-
+# ========= MAIN LOOP =========
 def main():
-    # init Telegram
-    tg = TelegramNotifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
+    logger = SheetLogger(SPREADSHEET_ID)
 
-    # init Sheets
-    try:
-        logger = SheetLogger(GOOGLE_CREDENTIALS, SPREADSHEET_ID)
-    except Exception as e:
-        print(f"[BOOT] ERRORE init SheetLogger: {e}")
-        tg.err(f"Avvio fallito: errore Google Sheet – {e}")
-        raise
+    # Annuncio avvio
+    logger.log("BOT ATTIVO", "bot")
+    notify_telegram("🤖 Bot Oro avviato correttamente!")
+    print("[START] Bot Oro avviato")
 
-    # Avvio
-    boot_msg = f"Bot ORO avviato ✓ – simbolo {SYMBOL}, heartbeat ogni {HEARTBEAT_SEC}s"
-    print("[BOOT]", boot_msg)
-    logger.info("BOT ATTIVO", "bot")
-    tg.ok(boot_msg)
-
-    # Loop “sempre vivo”
+    # Loop continuo
     while True:
         try:
-            px = fetch_price(SYMBOL)
-            logger.heartbeat(px)
+            price = get_price_binance(SYMBOL)
+
+            if price is not None:
+                # 1) Heartbeat nel log con prezzo
+                logger.log_heartbeat(price)
+                # 2) Aggiornamento “Ultimo ping” su Trade!K2
+                logger.update_last_ping(price)
+            else:
+                # Heartbeat anche se il prezzo non è disponibile
+                logger.log_heartbeat(None)
+
         except Exception as e:
-            err = f"Loop errore: {e}"
-            print("[LOOP] ERRORE:", e)
-            logger.error(err, "bot")
-            tg.err(err)
-        finally:
-            time.sleep(HEARTBEAT_SEC)
+            # Non deve mai fermarsi
+            logger.log("ERRORE", f"Loop exception: {e}", "bot")
 
+        time.sleep(HEARTBEAT_SECS)
 
+# ========= Run =========
 if __name__ == "__main__":
     main()
