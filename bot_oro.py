@@ -1,285 +1,199 @@
-# -*- coding: utf-8 -*-
-"""
-BOT ORO – monitoraggio PAXGUSDT + log su Google Sheet + notifiche Telegram
-• Env richieste:
-  - GOOGLE_CREDENTIALS  (JSON completo della service account)
-  - SPREADSHEET_ID
-  - TELEGRAM_BOT_TOKEN
-  - TELEGRAM_CHAT_ID
-  - ALERTS_ENABLED=true/false  (opzionale, default true)
-
-Fogli attesi nel Google Spreadsheet:
-  - Trade  (intestazioni in riga 1 come nello screenshot)
-  - Log
-"""
+# bot_oro.py
+# ------------------------------------------------------------
+# BOT ORO – heartbeat + logging + notifiche Telegram
+# Timezone allineata (Europe/Rome) e integrazione Google Sheet.
+# ------------------------------------------------------------
 
 import os
 import json
 import time
 from datetime import datetime
+import pytz
 import requests
 
+# Google Sheets
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
-# --- NOTIFICHE TELEGRAM ---
-# Assicùrati di avere notifier_telegram.py nel progetto con la classe TelegramNotifier
-from notifier_telegram import TelegramNotifier
+# opzionale: python-binance (per future estensioni/trading)
+try:
+    from binance.client import Client as BinanceClient
+except Exception:
+    BinanceClient = None
 
 
-# ==========================
-# Config
-# ==========================
-SYMBOL = "PAXGUSDT"               # Oro tokenizzato su Binance
-HEARTBEAT_SEC = 60                # ogni quanto fare ping/heartbeat
-ALERTS_ENABLED = os.getenv("ALERTS_ENABLED", "true").lower() != "false"
+# =========[ Config da ENV ]==================================
+
+SPREADSHEET_ID        = os.getenv("SPREADSHEET_ID", "").strip()
+GOOGLE_CREDENTIALS    = os.getenv("GOOGLE_CREDENTIALS", "").strip()
+
+TELEGRAM_BOT_TOKEN    = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID      = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+SYMBOL                = os.getenv("SYMBOL", "PAXGUSDT").upper().strip()
+HEARTBEAT_SEC         = int(os.getenv("HEARTBEAT_SEC", "60"))
+
+# dove scriviamo l’“Ultimo ping” nel foglio Trade
+TRADE_SHEET_NAME      = os.getenv("TRADE_SHEET_NAME", "Trade")
+TRADE_LASTPING_CELL   = os.getenv("TRADE_LASTPING_CELL", "K2")  # colonna “Ultimo ping” (screenshot)
+
+LOG_SHEET_NAME        = os.getenv("LOG_SHEET_NAME", "Log")
+
+# timezone unica e coerente
+TZ = pytz.timezone("Europe/Rome")
 
 
-# ==========================
-# Helpers
-# ==========================
-def now_str():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def now_str() -> str:
+    """Ritorna l’ora corrente già convertita in Europe/Rome e formattata."""
+    return datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def get_price(symbol: str) -> float | None:
-    """
-    Legge il last price da Binance public REST.
-    Ritorna float o None in caso di errore.
-    """
-    url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}"
-    try:
-        r = requests.get(url, timeout=8)
-        r.raise_for_status()
-        data = r.json()
-        return float(data["price"])
-    except Exception:
-        return None
+# =========[ Notifiche Telegram ]=============================
+
+class TelegramNotifier:
+    def __init__(self, token: str, chat_id: str):
+        self.token = token
+        self.chat_id = chat_id
+        self.base = f"https://api.telegram.org/bot{self.token}"
+
+    def enabled(self) -> bool:
+        return bool(self.token and self.chat_id)
+
+    def send(self, text: str) -> None:
+        if not self.enabled():
+            return
+        try:
+            r = requests.post(
+                f"{self.base}/sendMessage",
+                json={"chat_id": self.chat_id, "text": text}
+            )
+            r.raise_for_status()
+        except Exception as e:
+            # niente raise: non blocchiamo il bot per un problema di notifica
+            print(f"[TELEGRAM] errore invio: {e}")
+
+    # helper semantici
+    def info(self, text: str):  self.send(f"ℹ️ {text}")
+    def ok(self, text: str):    self.send(f"✅ {text}")
+    def warn(self, text: str):  self.send(f"⚠️ {text}")
+    def err(self, text: str):   self.send(f"❌ {text}")
 
 
-# ==========================
-# Google Sheet Logger
-# ==========================
+# =========[ Google Sheet logger ]============================
+
 class SheetLogger:
-    def __init__(self, spreadsheet_id: str):
+    """
+    Scrive su:
+      - Foglio Log: righe [Data/Ora, Livello, Messaggio, Sorgente]
+      - Foglio Trade: cella 'Ultimo ping' (ad es. K2)
+    """
+    def __init__(self, creds_json_str: str, spreadsheet_id: str):
+        if not creds_json_str:
+            raise RuntimeError("GOOGLE_CREDENTIALS mancante.")
+        if not spreadsheet_id:
+            raise RuntimeError("SPREADSHEET_ID mancante.")
+
         scope = [
             "https://spreadsheets.google.com/feeds",
             "https://www.googleapis.com/auth/drive",
         ]
-        raw = os.getenv("GOOGLE_CREDENTIALS")
-        if not raw:
-            raise RuntimeError("Variabile d'ambiente GOOGLE_CREDENTIALS mancante.")
 
         try:
-            creds_dict = json.loads(raw)
-        except json.JSONDecodeError as e:
+            creds_dict = json.loads(creds_json_str)
+        except json.JSONDecodeError:
             raise RuntimeError(
-                "GOOGLE_CREDENTIALS non è un JSON valido (controlla le \\n nella private_key)."
-            ) from e
+                "GOOGLE_CREDENTIALS non è un JSON valido. "
+                "Verifica le \\n nella private_key."
+            )
 
         creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
         gc = gspread.authorize(creds)
-        self.sh = gc.open_by_key(spreadsheet_id)
+        self.ss = gc.open_by_key(spreadsheet_id)
 
-        # Worksheet handles
-        self.ws_trade = self.sh.worksheet("Trade")
-        self.ws_log = self.sh.worksheet("Log")
+        # cache worksheet
+        self.ws_log = self.ss.worksheet(LOG_SHEET_NAME)
+        self.ws_trade = self.ss.worksheet(TRADE_SHEET_NAME)
 
-    # ---------- Log generico (foglio Log) ----------
-    def log(self, msg: str, tag: str = "bot"):
+    def _append_log(self, level: str, message: str, source: str = "bot"):
+        row = [now_str(), level, message, source]
+        self.ws_log.append_row(row, value_input_option="USER_ENTERED")
+
+    def info(self, message: str, source: str = "bot"):
+        self._append_log("INFO", message, source)
+
+    def error(self, message: str, source: str = "bot"):
+        self._append_log("ERRORE", message, source)
+
+    def heartbeat(self, price: float):
+        """
+        Scrive:
+          - Log: "Heartbeat OK – {price}"
+          - Trade!K2 (o cella configurata): "{timestamp} – {price}"
+        """
+        ts = now_str()
+        msg = f"Heartbeat OK – {price}"
+        self._append_log("INFO", msg, "bot")
+
+        # Aggiorna “Ultimo ping”
         try:
-            self.ws_log.append_row([now_str(), msg, tag], value_input_option="USER_ENTERED")
+            self.ws_trade.update(TRADE_LASTPING_CELL, f"{ts} – {price}")
         except Exception as e:
-            print(f"[ERRORE] Scrittura Log: {e}")
-
-    def log_heartbeat(self):
-        self.log("Heartbeat OK", "bot")
-
-    # ---------- Sezione TRADE ----------
-    def open_trade(self,
-                   trade_id: str,
-                   side: str,
-                   entry_price: float,
-                   qty: float,
-                   sl_pct: float,
-                   tp1_pct: float,
-                   tp2_pct: float,
-                   strategy: str,
-                   note: str = ""):
-        """
-        Aggiunge una riga nel foglio Trade con Stato = APERTO.
-        Le colonne sono allineate al tuo sheet:
-        A Data/Ora | B ID trade | C Lato | D Stato | E Prezzo ingresso | F Qty |
-        G SL % | H TP1 % | I TP2 % | J Prezzo chiusura | K Ultimo ping | L P&L % |
-        M P&L valore | N Equity post-trade | O Strategia | P Note
-        """
-        row = [
-            now_str(),            # A
-            trade_id,             # B
-            side.upper(),         # C
-            "APERTO",             # D
-            round(entry_price, 2),# E
-            round(qty, 6),        # F
-            sl_pct,               # G
-            tp1_pct,              # H
-            tp2_pct,              # I
-            "",                   # J Prezzo chiusura (vuoto)
-            "",                   # K Ultimo ping
-            "", "", "",           # L, M, N (P&L%, P&L valore, Equity post-trade)
-            strategy,             # O
-            note                  # P
-        ]
-        try:
-            self.ws_trade.append_row(row, value_input_option="USER_ENTERED")
-        except Exception as e:
-            print(f"[ERRORE] open_trade(): {e}")
-
-    def _find_row_by_trade_id(self, trade_id: str) -> int | None:
-        """
-        Cerca la riga (index 1-based nel foglio) con quel trade_id in colonna B.
-        Se più righe combaciano, ritorna la prima con Stato=APERTO (col D).
-        """
-        try:
-            values = self.ws_trade.get_all_values()
-            for i in range(2, len(values) + 1):  # salta header
-                row = values[i - 1]
-                if len(row) < 4:
-                    continue
-                if row[1] == trade_id and row[3].upper() == "APERTO":
-                    return i
-        except Exception as e:
-            print(f"[ERRORE] _find_row_by_trade_id(): {e}")
-        return None
-
-    def update_ping_all(self, price: float | None):
-        """
-        Scrive in colonna K (Ultimo ping) di tutte le righe con Stato=APERTO
-        il timestamp e – se disponibile – il prezzo.
-        """
-        if price is None:
-            val = f"{now_str()} - prezzo non disponibile"
-        else:
-            val = f"{now_str()} - {round(price, 2)}"
-
-        try:
-            values = self.ws_trade.get_all_values()
-            updates = []
-            for i in range(2, len(values) + 1):
-                row = values[i - 1]
-                if len(row) >= 4 and row[3].upper() == "APERTO":
-                    # colonna K = 11
-                    updates.append({"range": f"K{i}", "values": [[val]]})
-            if updates:
-                self.ws_trade.batch_update(updates, value_input_option="USER_ENTERED")
-        except Exception as e:
-            print(f"[ERRORE] update_ping_all(): {e}")
-
-    def close_trade(self,
-                    trade_id: str,
-                    close_price: float,
-                    pnl_pct: float,
-                    pnl_value: float,
-                    equity_after: float,
-                    note: str = "TP"):
-        """
-        Chiude la riga con quel trade_id (col D -> CHIUSO) e compila
-        J Prezzo chiusura, K Ultimo ping (aggiunge il tag TP/SL),
-        L P&L %, M P&L valore, N Equity post-trade, P Note.
-        """
-        row_idx = self._find_row_by_trade_id(trade_id)
-        if row_idx is None:
-            print(f"[WARN] close_trade(): trade_id {trade_id} non trovato.")
-            return
-
-        try:
-            self.ws_trade.update(f"D{row_idx}", "CHIUSO")    # stato
-            self.ws_trade.update(f"J{row_idx}", round(close_price, 2))
-            self.ws_trade.update(f"K{row_idx}", f"{now_str()}  {round(close_price, 2)}  {note}")
-            self.ws_trade.update(f"L{row_idx}", round(pnl_pct, 4))
-            self.ws_trade.update(f"M{row_idx}", round(pnl_value, 2))
-            self.ws_trade.update(f"N{row_idx}", round(equity_after, 2))
-            self.ws_trade.update(f"P{row_idx}", note)
-        except Exception as e:
-            print(f"[ERRORE] close_trade(): {e}")
+            # non bloccare il loop se la update singola fallisce
+            self._append_log("ERRORE", f"Aggiornamento Ultimo ping fallito: {e}", "bot")
 
 
-# ==========================
-# Notifiche wrapper
-# ==========================
-class Alerts:
-    def __init__(self):
-        self.enabled = ALERTS_ENABLED
-        self.tg = TelegramNotifier(min_interval_sec=2) if self.enabled else None
+# =========[ Price feed ]=====================================
 
-    def startup(self):
-        if self.tg:
-            self.tg.startup()
-
-    def trade_open(self, trade_id: str, side: str, qty: float, price: float, strategy: str):
-        if not self.tg:
-            return
-        txt = (
-            f"📈 *Trade APERTO*\n"
-            f"• ID: `{trade_id}`\n"
-            f"• {side.upper()}  qty: *{qty}*  @ *{round(price,2)}*\n"
-            f"• Strategia: `{strategy}`"
-        )
-        self.tg.send_markdown(txt)
-
-    def trade_close(self, trade_id: str, result: str, price: float, pnl_pct: float, pnl_value: float):
-        if not self.tg:
-            return
-        emoji = "✅" if result.upper() == "TP" else "🛑"
-        txt = (
-            f"{emoji} *Trade CHIUSO* ({result})\n"
-            f"• ID: `{trade_id}` @ *{round(price,2)}*\n"
-            f"• P&L: *{pnl_pct:.4f}%*   (*{pnl_value:.2f} USDT*)"
-        )
-        self.tg.send_markdown(txt)
-
-    def error(self, msg: str):
-        if self.tg:
-            self.tg.send(f"⚠️ ERRORE: {msg}")
+def fetch_price(symbol: str) -> float:
+    """
+    Ritorna l'ultimo prezzo come float.
+    - Prima prova tramite endpoint pubblico Binance (ticker price)
+    - In caso di problemi, rilancia l’eccezione
+    """
+    # REST pubblico (nessuna API key richiesta)
+    url = "https://api.binance.com/api/v3/ticker/price"
+    try:
+        r = requests.get(url, params={"symbol": symbol}, timeout=5)
+        r.raise_for_status()
+        data = r.json()
+        price = float(data["price"])
+        return price
+    except Exception as e:
+        raise RuntimeError(f"Impossibile ottenere prezzo {symbol}: {e}")
 
 
-# ==========================
-# ESECUZIONE
-# ==========================
+# =========[ Main loop ]======================================
+
 def main():
-    spreadsheet_id = os.getenv("SPREADSHEET_ID")
-    if not spreadsheet_id:
-        raise RuntimeError("SPREADSHEET_ID non impostata nelle variabili di ambiente.")
+    # init Telegram
+    tg = TelegramNotifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
 
-    logger = SheetLogger(spreadsheet_id)
-    alerts = Alerts()
-    alerts.startup()
-    logger.log("BOT ATTIVO", "bot")
+    # init Sheets
+    try:
+        logger = SheetLogger(GOOGLE_CREDENTIALS, SPREADSHEET_ID)
+    except Exception as e:
+        print(f"[BOOT] ERRORE init SheetLogger: {e}")
+        tg.err(f"Avvio fallito: errore Google Sheet – {e}")
+        raise
 
-    # — Esempio: se vuoi aprire un trade da codice, usa:
-    # trade_id = f"{SYMBOL}-{int(time.time())}"
-    # logger.open_trade(trade_id, "LONG", 3337.89, 1.497952, 0.005, 0.0002, 0.0003, "v1", "TP1")
-    # alerts.trade_open(trade_id, "LONG", 1.497952, 3337.89, "v1")
+    # Avvio
+    boot_msg = f"Bot ORO avviato ✓ – simbolo {SYMBOL}, heartbeat ogni {HEARTBEAT_SEC}s"
+    print("[BOOT]", boot_msg)
+    logger.info("BOT ATTIVO", "bot")
+    tg.ok(boot_msg)
 
+    # Loop “sempre vivo”
     while True:
         try:
-            px = get_price(SYMBOL)
-            # aggiorno colonna "Ultimo ping" per tutte le righe aperte
-            logger.update_ping_all(px)
-
-            # heartbeat su foglio Log
-            logger.log_heartbeat()
-
-            # (qui andrà la tua strategia: controlli TP/SL -> se chiudi:
-            # logger.close_trade(trade_id, close_price, pnl_pct, pnl_val, equity_after, note="TP")
-            # alerts.trade_close(trade_id, "TP", close_price, pnl_pct, pnl_val)
-            # )
-
+            px = fetch_price(SYMBOL)
+            logger.heartbeat(px)
         except Exception as e:
-            print(f"[LOOP] ERRORE: {e}")
-            logger.log(f"ERRORE loop: {e}", "bot")
-            alerts.error(str(e))
-
-        time.sleep(HEARTBEAT_SEC)
+            err = f"Loop errore: {e}"
+            print("[LOOP] ERRORE:", e)
+            logger.error(err, "bot")
+            tg.err(err)
+        finally:
+            time.sleep(HEARTBEAT_SEC)
 
 
 if __name__ == "__main__":
