@@ -14,7 +14,7 @@ from oauth2client.service_account import ServiceAccountCredentials
 
 # ========= Config base =========
 SYMBOL = "PAXGUSDT"              # Oro tokenizzato su Binance
-HEARTBEAT_SECS = int(os.getenv("HEARTBEAT_SECS", "60"))  # frequenza heartbeat / refresh "Ultimo ping"
+HEARTBEAT_SECS = 60              # frequenza heartbeat / refresh "Ultimo ping"
 
 # Foglio Google: usa variabile d'ambiente GOOGLE_CREDENTIALS (JSON) oppure file locale
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")  # obbligatoria
@@ -94,8 +94,8 @@ class SheetLogger:
         """Aggiorna Trade!K2 con 'YYYY-mm-dd HH:MM:SS – prezzo'."""
         try:
             text = f"{now_str()} - {price:.2f}"
-            # fix definitivo: usare update (valori prima, range dopo)
-            self.ws_trade.update("K2", [[text]], value_input_option="RAW")
+            # fix definitivo: usare update_acell per evitare DeprecationWarning
+            self.ws_trade.update_acell("K2", text)
         except Exception as e:
             self.log("ERRORE", f"Aggiornamento Ultimo ping fallito: {e}", "bot")
 
@@ -119,7 +119,7 @@ def main():
     logger = SheetLogger(SPREADSHEET_ID)
 
     # Annuncio avvio
-    logger.log("BOT ATTIVO", "Bot Oro avviato")
+    logger.log("BOT ATTIVO", "Bot avviato")
     notify_telegram("🤖 Bot Oro avviato correttamente!")
     print("[START] Bot Oro avviato")
 
