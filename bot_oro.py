@@ -11,27 +11,27 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
 # ===== Config =====
-SYMBOL = "PAXGUSDT"
-HEARTBEAT_SECS = 60  # frequenza loop
+SYMBOL = "PAXGUSDT"          # Oro tokenizzato su Binance
+HEARTBEAT_SECS = 60          # frequenza loop (s)
 
 # Limiti & regole trading (simulazione)
 MAX_OPEN   = 5
-UNIT_USDT  = 1.0     # capitale per trade
-SL_PCT     = 0.005   # -0,5%
-TP1_PCT    = 0.01    # +1%
-TP2_PCT    = 0.02    # +2%
+UNIT_USDT  = 1.0             # capitale per trade
+SL_PCT     = 0.005           # -0,5%
+TP1_PCT    = 0.01            # +1% (parziale)
+TP2_PCT    = 0.02            # +2% (chiusura totale)
 
 # Env richiesti
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")  # obbligatorio
 
-# Telegram (opzionale ma consigliato)
+# Telegram (opzionale)
 TG_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TG_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")  # es. 203729322
 
-# Fuso orario Italia (CET/CEST)
+# Fuso orario Italia (CET/CEST). Se vuoi auto-DST usa pytz/zoneinfo.
 TZ_ITALY = timezone(timedelta(hours=2))
 
-def now_str():
+def now_str() -> str:
     return datetime.now(TZ_ITALY).strftime("%Y-%m-%d %H:%M:%S")
 
 def notify_telegram(text: str):
@@ -41,6 +41,7 @@ def notify_telegram(text: str):
         url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
         requests.post(url, json={"chat_id": TG_CHAT_ID, "text": text}, timeout=10)
     except Exception:
+        # mai bloccare il bot per un problema di notifica
         pass
 
 # ===== Google Sheets =====
@@ -67,7 +68,9 @@ class SheetLogger:
             creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(raw), scope)
         else:
             if not os.path.exists("google_credentials.json"):
-                raise RuntimeError("Mancano le credenziali Google (env GOOGLE_CREDENTIALS o file google_credentials.json).")
+                raise RuntimeError(
+                    "Mancano le credenziali Google (env GOOGLE_CREDENTIALS o file google_credentials.json)."
+                )
             creds = ServiceAccountCredentials.from_json_keyfile_name("google_credentials.json", scope)
 
         client = gspread.authorize(creds)
@@ -78,7 +81,10 @@ class SheetLogger:
     # --- LOG sheet ---
     def log(self, level: str, message: str, extra: str="bot"):
         try:
-            self.ws_log.append_row([now_str(), level, message, extra], value_input_option="USER_ENTERED")
+            self.ws_log.append_row(
+                [now_str(), level, message, extra],
+                value_input_option="USER_ENTERED"
+            )
         except Exception as e:
             print(f"[ERRORE] Scrittura Log fallita: {e}")
 
@@ -88,7 +94,7 @@ class SheetLogger:
 
     # --- TRADE sheet helpers ---
     def list_open_rows(self) -> List[Dict[str, Any]]:
-        """Legge tutte le righe con Stato=APERTO (salta intestazioni)."""
+        """Ritorna le righe con Stato=APERTO (salta la riga header)."""
         rows = self.ws_trd.get_all_values()  # lista di liste
         out = []
         for idx, r in enumerate(rows, start=1):
@@ -101,25 +107,47 @@ class SheetLogger:
         return out
 
     def update_ping(self, row_idx: int, price: float):
-        text = f"{now_str()} - {price:.2f}"
-        self.ws_trd.update_cell(row_idx, self.COLS["PING"], text)
+        """Aggiorna la colonna 'Ultimo ping' della riga operazione."""
+        try:
+            text = f"{now_str()} - {price:.2f}"
+            self.ws_trd.update_cell(row_idx, self.COLS["PING"], text)
+        except Exception as e:
+            self.log("ERRORE", f"Update ping riga {row_idx} fallito: {e}", "bot")
+
+    def update_global_ping(self, price: float):
+        """Aggiorna anche Trade!K2 come riassunto visivo (comodo da controllare)."""
+        try:
+            text = f"{now_str()} - {price:.2f}"
+            # uso update_acell per evitare warning d’ordine argomenti
+            self.ws_trd.update_acell("K2", text)
+        except Exception as e:
+            self.log("ERRORE", f"Update K2 fallito: {e}", "bot")
 
     def update_pnl(self, row_idx: int, pnl_pct: float, pnl_val: float):
-        self.ws_trd.update_cell(row_idx, self.COLS["PNLpct"], round(pnl_pct, 4))
-        self.ws_trd.update_cell(row_idx, self.COLS["PNLval"], round(pnl_val, 2))
+        try:
+            self.ws_trd.update_cell(row_idx, self.COLS["PNLpct"], round(pnl_pct, 4))
+            self.ws_trd.update_cell(row_idx, self.COLS["PNLval"], round(pnl_val, 2))
+        except Exception as e:
+            self.log("ERRORE", f"Update PnL riga {row_idx} fallito: {e}", "bot")
 
     def mark_partial(self, row_idx: int, note: str):
-        cur = self.ws_trd.cell(row_idx, self.COLS["NOTE"]).value or ""
-        if "TP1" not in cur:
-            new_note = "TP1" if not cur else (cur + " | TP1")
-            self.ws_trd.update_cell(row_idx, self.COLS["NOTE"], new_note)
+        try:
+            cur = self.ws_trd.cell(row_idx, self.COLS["NOTE"]).value or ""
+            if "TP1" not in cur:
+                new_note = "TP1" if not cur else (cur + " | TP1")
+                self.ws_trd.update_cell(row_idx, self.COLS["NOTE"], new_note)
+        except Exception as e:
+            self.log("ERRORE", f"Update nota parziale riga {row_idx} fallito: {e}", "bot")
 
     def close_trade(self, row_idx: int, exit_price: float, reason: str):
-        self.ws_trd.update_cell(row_idx, self.COLS["EXIT"], round(exit_price, 2))
-        self.ws_trd.update_cell(row_idx, self.COLS["STATO"], "CHIUSO")
-        cur = self.ws_trd.cell(row_idx, self.COLS["NOTE"]).value or ""
-        new_note = reason if not cur else (cur + " | " + reason)
-        self.ws_trd.update_cell(row_idx, self.COLS["NOTE"], new_note)
+        try:
+            self.ws_trd.update_cell(row_idx, self.COLS["EXIT"], round(exit_price, 2))
+            self.ws_trd.update_cell(row_idx, self.COLS["STATO"], "CHIUSO")
+            cur = self.ws_trd.cell(row_idx, self.COLS["NOTE"]).value or ""
+            new_note = reason if not cur else (cur + " | " + reason)
+            self.ws_trd.update_cell(row_idx, self.COLS["NOTE"], new_note)
+        except Exception as e:
+            self.log("ERRORE", f"Chiusura riga {row_idx} fallita: {e}", "bot")
 
     def append_new_trade(self, trade_id: str, side: str, entry: float, qty: float,
                          sl_pct: float, tp1_pct: float, tp2_pct: float, strategy: str="v1"):
@@ -137,7 +165,10 @@ class SheetLogger:
             strategy,                # Strategia
             ""                       # Note
         ]
-        self.ws_trd.append_row(row, value_input_option="USER_ENTERED")
+        try:
+            self.ws_trd.append_row(row, value_input_option="USER_ENTERED")
+        except Exception as e:
+            self.log("ERRORE", f"Append nuova operazione fallito: {e}", "bot")
 
 # ===== Prezzo Binance =====
 def get_price_binance(symbol: str) -> Optional[float]:
@@ -165,7 +196,6 @@ class TradeEngine:
         n_open = len(open_rows)
         if n_open >= MAX_OPEN:
             return
-        # apri fino a MAX_OPEN
         for _ in range(MAX_OPEN - n_open):
             qty = self._qty_for_unit_usdt(price)
             trade_id = f"{SYMBOL}_{int(time.time()*1000)}"
@@ -173,7 +203,9 @@ class TradeEngine:
                 trade_id=trade_id, side="LONG", entry=price, qty=qty,
                 sl_pct=SL_PCT, tp1_pct=TP1_PCT, tp2_pct=TP2_PCT, strategy="v1"
             )
-            notify_telegram(f"🟢 NUOVA OPERAZIONE\nID: {trade_id}\nSide: LONG\nEntry: {price:.2f}\nQty: {qty:.6f}")
+            notify_telegram(
+                f"🟢 NUOVA OPERAZIONE\nID: {trade_id}\nSide: LONG\nEntry: {price:.2f}\nQty: {qty:.6f}"
+            )
             self.lg.log("INFO", f"Aperto LONG @ {price:.2f}", "bot")
 
     def _eval_and_update(self, price: float):
@@ -190,7 +222,7 @@ class TradeEngine:
             except Exception:
                 continue
 
-            # ping & pnl
+            # ping (riga) + pnl
             self.lg.update_ping(idx, price)
             pnl_pct = (price/entry - 1.0) * 100.0   # %
             pnl_val = (price - entry) * qty         # USDT circa
@@ -206,21 +238,27 @@ class TradeEngine:
             # SL chiusura totale
             if sl_hit:
                 self.lg.close_trade(idx, price, "SL")
-                notify_telegram(f"🔴 CHIUSO (SL)\nEntry: {entry:.2f}\nExit: {price:.2f}\nPnL: {pnl_pct:.2f}% ({pnl_val:.2f})")
+                notify_telegram(
+                    f"🔴 CHIUSO (SL)\nEntry: {entry:.2f}\nExit: {price:.2f}\nPnL: {pnl_pct:.2f}% ({pnl_val:.2f})"
+                )
                 self.lg.log("INFO", f"Chiuso SL @ {price:.2f}", "bot")
                 continue
 
             # TP2 chiusura totale
             if tp2_hit:
                 self.lg.close_trade(idx, price, "TP2")
-                notify_telegram(f"🟢 CHIUSO (TP2)\nEntry: {entry:.2f}\nExit: {price:.2f}\nPnL: {pnl_pct:.2f}% ({pnl_val:.2f})")
+                notify_telegram(
+                    f"🟢 CHIUSO (TP2)\nEntry: {entry:.2f}\nExit: {price:.2f}\nPnL: {pnl_pct:.2f}% ({pnl_val:.2f})"
+                )
                 self.lg.log("INFO", f"Chiuso TP2 @ {price:.2f}", "bot")
                 continue
 
             # TP1 parziale (una sola volta)
             if tp1_hit and "TP1" not in note:
                 self.lg.mark_partial(idx, "TP1")
-                notify_telegram(f"🟡 PARZIALE (TP1)\nEntry: {entry:.2f}\nPrezzo: {price:.2f}\nPnL: {pnl_pct:.2f}%")
+                notify_telegram(
+                    f"🟡 PARZIALE (TP1)\nEntry: {entry:.2f}\nPrezzo: {price:.2f}\nPnL: {pnl_pct:.2f}%"
+                )
                 self.lg.log("INFO", f"TP1 raggiunto @ {price:.2f}", "bot")
 
     def step(self, price: Optional[float]):
@@ -229,6 +267,8 @@ class TradeEngine:
             return
         # heartbeat con prezzo
         self.lg.log_heartbeat(price)
+        # aggiorna anche la K2 globale (riassunto visivo)
+        self.lg.update_global_ping(price)
         # valuta tutte le aperte
         self._eval_and_update(price)
         # apri nuove fino al limite
