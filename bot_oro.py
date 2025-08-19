@@ -266,7 +266,7 @@ def gen_trade_id(symbol: str, row_index: int) -> str:
 def reconcile_and_notify_starts(ws_trade, ws_log, symbol: str):
     """
     - Se 'Prezzo chiusura' è pieno e 'Stato' è vuoto/APERTO -> CHIUSO.
-    - Se 'Prezzo ingresso' è pieno e 'Stato' è vuoto -> APERTO.
+    - Se 'Prezzo ingresso' (cella NON vuota) e 'Stato' è vuoto -> APERTO.
     - Se APERTO ma manca 'ID trade' -> genera ID.
     - Se riga APERTA appena riconosciuta -> invia messaggio START (una sola volta).
     """
@@ -287,43 +287,52 @@ def reconcile_and_notify_starts(ws_trade, ws_log, symbol: str):
     L_TP2 = H.get("tp2 %")
     L_SL  = H.get("sl %")
 
-    rows = ws_trade.get_all_values()  # << eseguita RARAMENTE, non ad ogni loop
+    rows = ws_trade.get_all_values()
     if len(rows) <= 1:
         return
 
     log_msgs = log_get_messages(ws_log)
     updates = []
 
-    for r in range(2, len(rows)+1):
-        row = rows[r-1]
-        stato = (row[L_STATO-1] if len(row) >= L_STATO else "").strip().upper()
-        trade_id = (row[L_ID-1] if len(row) >= L_ID else "").strip()
-        side = (row[L_LATO-1] if len(row) >= L_LATO else "LONG").strip().upper()
-        entry_str = (row[L_ENTRY-1] if len(row) >= L_ENTRY else "").strip()
+    for r in range(2, len(rows) + 1):
+        row = rows[r - 1]
+        stato = (row[L_STATO - 1] if len(row) >= L_STATO else "").strip().upper()
+        trade_id = (row[L_ID - 1] if len(row) >= L_ID else "").strip()
+        side = (row[L_LATO - 1] if len(row) >= L_LATO else "LONG").strip().upper()
+        entry_str = (row[L_ENTRY - 1] if len(row) >= L_ENTRY else "").strip()
         entry = d(entry_str) if entry_str else Decimal("0")
-        close_str = (row[L_CLOSE-1] if L_CLOSE and len(row) >= L_CLOSE else "").strip()
+        close_str = (row[L_CLOSE - 1] if L_CLOSE and len(row) >= L_CLOSE else "").strip()
         has_close = bool(close_str)
 
-        # chiudi se incoerente
+        # Se ha un prezzo di chiusura ma non è segnato chiuso -> chiudi
         if has_close and stato in ("", "APERTO"):
-            updates.append({"range": gspread.utils.rowcol_to_a1(r, L_STATO), "values": [["CHIUSO"]]})
+            updates.append({
+                "range": gspread.utils.rowcol_to_a1(r, L_STATO),
+                "values": [["CHIUSO"]]
+            })
             stato = "CHIUSO"
 
-        # apri se la cella entry NON è vuota e lo stato è vuoto
+        # Se la cella entry NON è vuota e lo stato è vuoto -> APERTO
         if entry_str and stato == "":
-            updates.append({"range": gspread.utils.rowcol_to_a1(r, L_STATO), "values": [["APERTO"]]})
+            updates.append({
+                "range": gspread.utils.rowcol_to_a1(r, L_STATO),
+                "values": [["APERTO"]]
+            })
             stato = "APERTO"
 
-        # genera ID se manca
+        # Genera ID se manca su riga APERTA
         if stato == "APERTO" and not trade_id:
             trade_id = gen_trade_id(symbol, r)
-            updates.append({"range": gspread.utils.rowcol_to_a1(r, L_ID), "values": [[trade_id]]})
+            updates.append({
+                "range": gspread.utils.rowcol_to_a1(r, L_ID),
+                "values": [[trade_id]]
+            })
 
-        # notifica START una volta
+        # START una sola volta
         if stato == "APERTO" and entry > 0 and not start_already_notified(log_msgs, trade_id):
-            TP1 = d(row[L_TP1-1]) if L_TP1 and len(row) >= L_TP1 and (row[L_TP1-1] or "").strip() else TP1_PCT
-            TP2 = d(row[L_TP2-1]) if L_TP2 and len(row) >= L_TP2 and (row[L_TP2-1] or "").strip() else TP2_PCT
-            SL  = d(row[L_SL-1])  if L_SL  and len(row) >= L_SL  and (row[L_SL-1]  or "").strip() else SL_PCT
+            TP1 = d(row[L_TP1 - 1]) if L_TP1 and len(row) >= L_TP1 and (row[L_TP1 - 1] or "").strip() else TP1_PCT
+            TP2 = d(row[L_TP2 - 1]) if L_TP2 and len(row) >= L_TP2 and (row[L_TP2 - 1] or "").strip() else TP2_PCT
+            SL  = d(row[L_SL  - 1]) if L_SL  and len(row) >= L_SL  and (row[L_SL  - 1]  or "").strip() else SL_PCT
 
             msg = (
                 f"🚀 BOT ORO | {symbol}\n"
@@ -336,7 +345,10 @@ def reconcile_and_notify_starts(ws_trade, ws_log, symbol: str):
             log(ws_log, "INFO", f"Aperto trade {trade_id} @ {fmt_dec(entry)} (riconosciuto)")
 
     if updates:
-        ws_trade.spreadsheet.values_batch_update({"valueInputOption": "USER_ENTERED", "data": updates})
+        ws_trade.spreadsheet.values_batch_update({
+            "valueInputOption": "USER_ENTERED",
+            "data": updates
+        })
 
 
 # ========= OPERATIVA PRINCIPALE =========
