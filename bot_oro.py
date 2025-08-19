@@ -38,6 +38,16 @@ POLL_SECONDS = int(os.getenv("POLL_SECONDS", "8"))
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Rome")
 AUTO_OPEN_ON_START = os.getenv("AUTO_OPEN_ON_START", "0") == "1"  # se 1, apre 1 trade all'avvio
 
+# Debug / throttle log
+DEBUG_HEADERS = os.getenv("DEBUG_HEADERS", "0") == "1"
+HEARTBEAT_MIN_SECONDS = int(os.getenv("HEARTBEAT_MIN_SECONDS", "60"))  # scrivi heartbeat ogni X secondi minimo
+HEARTBEAT_PRICE_DELTA_BP = int(os.getenv("HEARTBEAT_PRICE_DELTA_BP", "2"))  # basis points (2 = 0.02%)
+
+# Stato interno per throttling
+_LAST_HEADER_SIG = None
+_LAST_HEARTBEAT_TS = 0
+_LAST_HEARTBEAT_PRICE = None
+
 
 # ========= UTILS =========
 def d(x) -> Decimal:
@@ -137,14 +147,24 @@ def get_header(ws):
     if not header: raise RuntimeError(f"La tab '{ws.title}' non ha intestazioni.")
     return header
 
-def dump_headers(ws_trade, ws_log):
+def header_signature(header_row):
+    return "|".join([h.strip().lower() for h in header_row])
+
+def dump_headers_once(ws_trade, ws_log):
+    """Logga gli header solo se cambiano e solo se DEBUG_HEADERS=1."""
+    global _LAST_HEADER_SIG
+    if not DEBUG_HEADERS:
+        return
     header = ws_trade.row_values(1)
-    try:
-        ws_log.append_row([now_local_str(), "INFO", f"[DEBUG] Header Trade raw: {header}", "bot"], value_input_option="USER_ENTERED")
-        H = build_header_map(header)
-        ws_log.append_row([now_local_str(), "INFO", f"[DEBUG] Header mappati: {sorted(list(H.keys()))}", "bot"], value_input_option="USER_ENTERED")
-    except Exception as e:
-        print("[DEBUG] dump_headers error:", e)
+    sig = header_signature(header)
+    if sig != _LAST_HEADER_SIG:
+        _LAST_HEADER_SIG = sig
+        try:
+            ws_log.append_row([now_local_str(), "INFO", f"[DEBUG] Header Trade raw: {header}", "bot"], value_input_option="USER_ENTERED")
+            H = build_header_map(header)
+            ws_log.append_row([now_local_str(), "INFO", f"[DEBUG] Header mappati: {sorted(list(H.keys()))}", "bot"], value_input_option="USER_ENTERED")
+        except Exception as e:
+            print("[DEBUG] dump_headers_once error:", e)
 
 def find_col_by_header(ws, header_name: str) -> int:
     header = ws.row_values(1)
@@ -295,12 +315,37 @@ def log(ws_log, level, msg):
     except Exception as e:
         print(f"[LOG] {level}: {msg} ({e})")
 
+def should_log_heartbeat(price: Decimal) -> bool:
+    """Decide se scrivere la riga 'Heartbeat OK - price' per evitare spam."""
+    global _LAST_HEARTBEAT_TS, _LAST_HEARTBEAT_PRICE
+    now_ts = time.time()
+    if _LAST_HEARTBEAT_TS == 0 or _LAST_HEARTBEAT_PRICE is None:
+        _LAST_HEARTBEAT_TS = now_ts
+        _LAST_HEARTBEAT_PRICE = price
+        return True
+    # tempo
+    if now_ts - _LAST_HEARTBEAT_TS >= HEARTBEAT_MIN_SECONDS:
+        _LAST_HEARTBEAT_TS = now_ts
+        _LAST_HEARTBEAT_PRICE = price
+        return True
+    # delta prezzo in basis points
+    try:
+        if price > 0 and _LAST_HEARTBEAT_PRICE > 0:
+            move_bp = abs((price - _LAST_HEARTBEAT_PRICE) / _LAST_HEARTBEAT_PRICE) * 10000
+            if move_bp >= HEARTBEAT_PRICE_DELTA_BP:
+                _LAST_HEARTBEAT_TS = now_ts
+                _LAST_HEARTBEAT_PRICE = price
+                return True
+    except Exception:
+        pass
+    return False
+
 def update_open_rows(ws_trade, ws_log, client):
     # ripara stati + notifica START per nuove righe
     reconcile_and_notify_starts(ws_trade, ws_log, SYMBOL)
 
-    # DEBUG: stampa header che vede
-    dump_headers(ws_trade, ws_log)
+    # Logga header solo se cambiano e solo se DEBUG_HEADERS=1
+    dump_headers_once(ws_trade, ws_log)
 
     header = get_header(ws_trade)
     H = build_header_map(header)
@@ -340,7 +385,7 @@ def update_open_rows(ws_trade, ws_log, client):
     if len(rows) <= 1:
         try:
             ws_trade.update_cell(2, col_ping, f"{nowloc} - {fmt_dec(lastp)}")
-            log(ws_log, "INFO", "[DEBUG] Nessuna riga trade. Aggiornato K2 (Ultimo ping).")
+            # niente log spam qui
         except Exception as e:
             log(ws_log, "ERROR", f"[DEBUG] update_cell K2 fallito: {e}")
         return
@@ -411,6 +456,10 @@ def update_open_rows(ws_trade, ws_log, client):
     if updates:
         ws_trade.spreadsheet.values_batch_update({"valueInputOption":"USER_ENTERED","data":updates})
 
+    # Heartbeat log (throttled)
+    if should_log_heartbeat(lastp):
+        log(ws_log, "INFO", f"Heartbeat OK - {fmt_dec(lastp)}")
+
 
 def open_new_trade(ws_trade, ws_log, trade_id: str, side="LONG", qty=Decimal("1")):
     header=get_header(ws_trade); H=build_header_map(header)
@@ -449,8 +498,10 @@ def main_loop():
     client = binance_client()
     log(ws_log,"INFO",f"Bot Oro avviato · Trade='{ws_trade.title}', Log='{ws_log.title}' · TZ={TIMEZONE}")
 
-    # dump header e ripara subito + invia START per righe APERTE non ancora notificate
-    dump_headers(ws_trade, ws_log)
+    # logga header solo all'avvio (e poi solo se cambiano)
+    dump_headers_once(ws_trade, ws_log)
+
+    # ripara subito e invia START per righe APERTE non ancora notificate
     reconcile_and_notify_starts(ws_trade, ws_log, SYMBOL)
 
     if AUTO_OPEN_ON_START:
@@ -462,7 +513,6 @@ def main_loop():
     while True:
         try:
             update_open_rows(ws_trade, ws_log, client)
-            log(ws_log,"INFO",f"Heartbeat OK - {fmt_dec(get_last_price(client))}")
         except Exception as e:
             log(ws_log,"ERROR",str(e))
         time.sleep(POLL_SECONDS)
