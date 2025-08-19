@@ -30,7 +30,7 @@ TWILIO_AUTH_TOKEN  = os.getenv("TWILIO_AUTH_TOKEN", "")
 TWILIO_FROM = os.getenv("TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886")
 TWILIO_TO   = os.getenv("TWILIO_TO", "")
 
-# Telegram (nuovo)
+# Telegram (opzionale)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")  # -100... per canali/gruppi oppure ID utente
 
@@ -105,23 +105,24 @@ def open_sheets():
     sh = gc.open_by_key(SPREADSHEET_ID)
     return open_ws_by_title(sh, SHEET_TAB_TRADE), open_ws_by_title(sh, SHEET_TAB_LOG)
 
+# === Alias più tolleranti ===
 ALIAS = {
     "data/ora": ["data ora","timestamp","datetime","dataora","data"],
     "id trade": ["id","trade id","ordine id"],
     "lato": ["side","direzione"],
     "stato": ["status","state"],
-    "prezzo ingresso": ["ingresso","entry","entry price","prezzo entry"],
-    "qty": ["quantita","quantity","size"],
-    "sl %": ["sl","stop loss","stoploss","sl pct"],
-    "tp1 %": ["tp1","take profit 1","tp1 pct"],
-    "tp2 %": ["tp2","take profit 2","tp2 pct"],
-    "prezzo chiusura": ["close","exit","chiusura","prezzo close"],
-    "ultimo ping": ["ping","ultimo prezzo","last price","last ping"],
-    "p&l %": ["pl %","pnl %","profit %"],
-    "p&l valore": ["pl","pnl","profit"],
-    "equity post-trade": ["equity","saldo","balance","equity post trade"],
+    "prezzo ingresso": ["ingresso","entry","entry price","prezzo entry","prezzo d'ingresso","prezzo di ingresso"],
+    "qty": ["quantita","quantity","size","q.tà","quantità"],
+    "sl %": ["sl","stop loss","stoploss","sl pct","sl percentuale"],
+    "tp1 %": ["tp1","take profit 1","tp1 pct","tp1 percentuale"],
+    "tp2 %": ["tp2","take profit 2","tp2 pct","tp2 percentuale"],
+    "prezzo chiusura": ["close","exit","chiusura","prezzo close","prezzo di chiusura"],
+    "ultimo ping": ["ping","ultimo prezzo","last price","last ping","heartbeat","ultimo aggiornamento"],
+    "p&l %": ["pl %","pnl %","profit %","p e l %"],
+    "p&l valore": ["pl","p l","pnl","profit","pl valore","pnl valore","p e l valore","p & l valore"],
+    "equity post-trade": ["equity","saldo","balance","equity post trade","equity post trade","equity post − trade","equity post – trade","equity post — trade"],
     "strategia": ["strategy","strat"],
-    "note": ["notes","esito","tp/sl","esecuzione"],
+    "note": ["notes","esito","tp/sl","esecuzione","nota"],
 }
 def build_header_map(header_row):
     H={}
@@ -135,6 +136,25 @@ def get_header(ws):
     header=ws.row_values(1)
     if not header: raise RuntimeError(f"La tab '{ws.title}' non ha intestazioni.")
     return header
+
+def dump_headers(ws_trade, ws_log):
+    header = ws_trade.row_values(1)
+    try:
+        ws_log.append_row([now_local_str(), "INFO", f"[DEBUG] Header Trade raw: {header}", "bot"], value_input_option="USER_ENTERED")
+        H = build_header_map(header)
+        ws_log.append_row([now_local_str(), "INFO", f"[DEBUG] Header mappati: {sorted(list(H.keys()))}", "bot"], value_input_option="USER_ENTERED")
+    except Exception as e:
+        print("[DEBUG] dump_headers error:", e)
+
+def find_col_by_header(ws, header_name: str) -> int:
+    header = ws.row_values(1)
+    if not header:
+        raise RuntimeError(f"La tab '{ws.title}' non ha intestazioni.")
+    target = (header_name or "").strip().lower()
+    for i, h in enumerate(header, start=1):
+        if (h or "").strip().lower() == target:
+            return i
+    raise RuntimeError(f"Header '{header_name}' non trovato in '{ws.title}': {header}")
 
 
 # ========= BINANCE =========
@@ -279,24 +299,55 @@ def update_open_rows(ws_trade, ws_log, client):
     # ripara stati + notifica START per nuove righe
     reconcile_and_notify_starts(ws_trade, ws_log, SYMBOL)
 
+    # DEBUG: stampa header che vede
+    dump_headers(ws_trade, ws_log)
+
     header = get_header(ws_trade)
     H = build_header_map(header)
 
-    need = ["prezzo ingresso","ultimo ping","p&l %","p&l valore","equity post-trade"]
-    for k in need:
-        if k not in H: raise RuntimeError(f"Manca colonna '{k}' in '{ws_trade.title}'.")
+    # trova colonna 'Ultimo ping' in modo robusto
+    try:
+        col_ping = find_col_by_header(ws_trade, "Ultimo ping")
+    except Exception as e:
+        log(ws_log, "ERROR", f"[DEBUG] Colonna 'Ultimo ping' non trovata: {e}")
+        return
+
+    # controlli minimi
+    need = ["prezzo ingresso","p&l %","p&l valore","equity post-trade"]
+    missing = [k for k in need if k not in H]
+    if missing:
+        log(ws_log, "ERROR", f"Mancano colonne in '{ws_trade.title}': {missing}")
+        # Anche se mancano, aggiorno K2 per darti heartbeat visivo:
+        try:
+            nowloc = now_local_str()
+            lastp = get_last_price(client)
+            if lastp != 0:
+                ws_trade.update_cell(2, col_ping, f"{nowloc} - {fmt_dec(lastp)}")
+        except Exception as e2:
+            log(ws_log, "ERROR", f"[DEBUG] update_cell K2 fallito: {e2}")
+        return
+
+    rows = ws_trade.get_all_values()
+    nowloc = now_local_str()
+    lastp = get_last_price(client)
+    if lastp==0:
+        log(ws_log,"WARN","Prezzo 0 da Binance")
+        return
+
+    updates=[]
+
+    # >>> Heartbeat K2 anche con solo header
+    if len(rows) <= 1:
+        try:
+            ws_trade.update_cell(2, col_ping, f"{nowloc} - {fmt_dec(lastp)}")
+            log(ws_log, "INFO", "[DEBUG] Nessuna riga trade. Aggiornato K2 (Ultimo ping).")
+        except Exception as e:
+            log(ws_log, "ERROR", f"[DEBUG] update_cell K2 fallito: {e}")
+        return
 
     L_STATO = H.get("stato"); L_LATO = H.get("lato"); L_QTY = H.get("qty")
     L_NOTE = H.get("note"); L_CLOSE = H.get("prezzo chiusura")
 
-    rows = ws_trade.get_all_values()
-    if len(rows)<=1: return
-
-    nowloc = now_local_str()
-    lastp = get_last_price(client)
-    if lastp==0: log(ws_log,"WARN","Prezzo 0 da Binance"); return
-
-    updates=[]
     for r in range(2, len(rows)+1):
         row = rows[r-1]
         stato = (row[L_STATO-1] if L_STATO and len(row)>=L_STATO else "").strip().upper()
@@ -304,9 +355,11 @@ def update_open_rows(ws_trade, ws_log, client):
         entry = d(row[H["prezzo ingresso"]-1]) if len(row)>=H["prezzo ingresso"] else Decimal("0")
         qty   = d(row[L_QTY-1]) if L_QTY and len(row)>=L_QTY else Decimal("1")
 
-        # Ping (ora locale)
-        updates.append({"range": gspread.utils.rowcol_to_a1(r, H["ultimo ping"]),
-                        "values":[[f"{nowloc} - {fmt_dec(lastp)}"]]})
+        # Ping (ora locale) per OGNI riga
+        updates.append({
+            "range": gspread.utils.rowcol_to_a1(r, col_ping),
+            "values": [[f"{nowloc} - {fmt_dec(lastp)}"]],
+        })
 
         if stato == "CHIUSO" or entry == 0:
             continue
@@ -396,7 +449,8 @@ def main_loop():
     client = binance_client()
     log(ws_log,"INFO",f"Bot Oro avviato · Trade='{ws_trade.title}', Log='{ws_log.title}' · TZ={TIMEZONE}")
 
-    # ripara subito e invia START per righe APERTE non ancora notificate
+    # dump header e ripara subito + invia START per righe APERTE non ancora notificate
+    dump_headers(ws_trade, ws_log)
     reconcile_and_notify_starts(ws_trade, ws_log, SYMBOL)
 
     if AUTO_OPEN_ON_START:
