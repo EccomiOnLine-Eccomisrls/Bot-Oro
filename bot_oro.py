@@ -310,9 +310,9 @@ def reconcile_and_notify_starts(ws_trade, ws_log, symbol: str):
             stato = "CHIUSO"
 
         # apri se la cella entry NON è vuota e lo stato è vuoto
-     if entry_str and stato == "":
-    updates.append({"range": gspread.utils.rowcol_to_a1(r, L_STATO), "values": [["APERTO"]]})
-    stato = "APERTO"
+        if entry_str and stato == "":
+            updates.append({"range": gspread.utils.rowcol_to_a1(r, L_STATO), "values": [["APERTO"]]})
+            stato = "APERTO"
 
         # genera ID se manca
         if stato == "APERTO" and not trade_id:
