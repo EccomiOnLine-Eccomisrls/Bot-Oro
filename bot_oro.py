@@ -340,6 +340,6 @@ def main_loop():
         time.sleep(POLL_SECONDS)
 
 if __name__ == "__main__":
-    # Per test: sblocca la prossima riga per aprire un trade all'avvio
-    # ws_trade, ws_log = open_sheets(); open_new_trade(ws_trade, ws_log, trade_id=f"{SYMBOL}-{int(time.time())}-A")
+    ws_trade, ws_log = open_sheets()
+    open_new_trade(ws_trade, ws_log, trade_id=f"{SYMBOL}-{int(time.time())}-A", side="LONG")
     main_loop()
