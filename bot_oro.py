@@ -59,9 +59,41 @@ _COL_PING_CACHE = None
 
 # ========= UTILS =========
 def d(x) -> Decimal:
-    if isinstance(x, Decimal): return x
-    try: return Decimal(str(x))
-    except (InvalidOperation, TypeError): return Decimal("0")
+    """
+    Converte stringhe stile IT/EN in Decimal:
+    - '2345,67' -> 2345.67
+    - '0,02%'   -> 0.0002
+    """
+    if isinstance(x, Decimal):
+        return x
+    if x is None:
+        return Decimal("0")
+    s = str(x).strip()
+    if not s:
+        return Decimal("0")
+
+    is_percent = False
+    if s.endswith("%"):
+        is_percent = True
+        s = s[:-1].strip()
+
+    s = s.replace(" ", "")
+
+    # se contiene sia . che , => interpreto , come decimale
+    if "." in s and "," in s:
+        s = s.replace(".", "")
+        s = s.replace(",", ".")
+    elif "," in s:
+        s = s.replace(",", ".")
+
+    try:
+        val = Decimal(s)
+    except:
+        return Decimal("0")
+
+    if is_percent:
+        val = val / Decimal("100")
+    return val
 
 def fmt_dec(x: Decimal, q="0.00001") -> str:
     return d(x).quantize(Decimal(q), rounding=ROUND_HALF_UP).normalize().to_eng_string()
@@ -277,10 +309,10 @@ def reconcile_and_notify_starts(ws_trade, ws_log, symbol: str):
             updates.append({"range": gspread.utils.rowcol_to_a1(r, L_STATO), "values": [["CHIUSO"]]})
             stato = "CHIUSO"
 
-        # apri se ha entry ma stato vuoto
-        if entry > 0 and stato == "":
-            updates.append({"range": gspread.utils.rowcol_to_a1(r, L_STATO), "values": [["APERTO"]]})
-            stato = "APERTO"
+        # apri se la cella entry NON è vuota e lo stato è vuoto
+     if entry_str and stato == "":
+    updates.append({"range": gspread.utils.rowcol_to_a1(r, L_STATO), "values": [["APERTO"]]})
+    stato = "APERTO"
 
         # genera ID se manca
         if stato == "APERTO" and not trade_id:
