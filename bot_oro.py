@@ -168,6 +168,7 @@ ALIAS = {
     "tp2 %": ["tp2","take profit 2","tp2 pct","tp2 percentuale"],
     "prezzo chiusura": ["close","exit","chiusura","prezzo close","prezzo di chiusura"],
     "ultimo ping": ["ping","ultimo prezzo","last price","last ping","heartbeat","ultimo aggiornamento"],
+    "delta": ["differenza", "delta prezzo", "diff", "delta $", "delta value"],
     "p&l %": ["pl %","pnl %","profit %","p e l %"],
     "p&l valore": ["pl","p l","pnl","profit","pl valore","pnl valore","p e l valore","p & l valore"],
     "equity post-trade": ["equity","saldo","balance","equity post trade","equity post trade","equity post − trade","equity post – trade","equity post — trade"],
@@ -468,12 +469,26 @@ def update_open_rows_light(ws_trade, ws_log, client, H, col_ping):
             elif lastp >= sl: hit, close_price = "SL", sl
 
         if not hit:
-            pnl_pct, pnl_val = pnl_values(side, entry, lastp, qty)
-            updates += [
-                {"range": gspread.utils.rowcol_to_a1(r, plpct_col_idx), "values": [[fmt_dec(pnl_pct,"0.0001")]]},
-                {"range": gspread.utils.rowcol_to_a1(r, plval_col_idx), "values": [[fmt_dec(pnl_val,"0.01")]]},
-            ]
-            continue
+    # P&L % e P&L valore (guadagno/perdita istantanei)
+    pnl_pct, pnl_val = pnl_values(side, entry, lastp, qty)
+
+    # Delta prezzo istantaneo (Last - Entry per LONG, Entry - Last per SHORT)
+    delta_price = (lastp - entry) if side == "LONG" else (entry - lastp)
+
+    row_updates = [
+        {"range": gspread.utils.rowcol_to_a1(r, plpct_col_idx), "values": [[fmt_dec(pnl_pct, "0.0001")]]},
+        {"range": gspread.utils.rowcol_to_a1(r, plval_col_idx), "values": [[fmt_dec(pnl_val, "0.01")]]},
+    ]
+
+    # Se esiste la colonna Delta, aggiorna anche la differenza di prezzo
+    if "delta" in H:
+        row_updates.append({
+            "range": gspread.utils.rowcol_to_a1(r, H["delta"]),
+            "values": [[fmt_dec(delta_price, "0.01")]]
+        })
+
+    updates += row_updates
+    continue
 
         # CHIUSURA
         pnl_pct, pnl_val = pnl_values(side, entry, close_price, qty)
