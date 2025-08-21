@@ -38,6 +38,11 @@ POLL_SECONDS = int(os.getenv("POLL_SECONDS", "8"))
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Rome")
 AUTO_OPEN_ON_START = os.getenv("AUTO_OPEN_ON_START", "0") == "1"  # se 1, apre 1 trade all'avvio
 
+# Auto-apertura continua per mantenere almeno N trade
+MIN_OPEN_TRADES = int(os.getenv("MIN_OPEN_TRADES", "5"))   # minimo trades APERTI da mantenere
+AUTO_TRADE_SIDE = os.getenv("AUTO_TRADE_SIDE", "LONG")      # lato predefinito (LONG/SHORT)
+DEFAULT_QTY     = Decimal(os.getenv("DEFAULT_QTY", "1"))    # qty predefinito
+
 # Debug / throttle log
 DEBUG_HEADERS = os.getenv("DEBUG_HEADERS", "0") == "1"
 HEARTBEAT_MIN_SECONDS = int(os.getenv("HEARTBEAT_MIN_SECONDS", "60"))  # scrivi heartbeat log ogni X s minimo
@@ -557,6 +562,41 @@ def open_new_trade(ws_trade, ws_log, trade_id: str, side="LONG", qty=Decimal("1"
     log(ws_log,"INFO",f"Aperto trade {trade_id} @ {fmt_dec(price)}")
     notify(msg)
 
+def ensure_min_open_trades(ws_trade, ws_log, H, col_ping,
+                           min_trades=5, side="LONG", qty=Decimal("1")):
+    """
+    Conta quanti trade sono APERTI e, se < min_trades, ne apre subito di nuovi
+    usando open_new_trade(...) con prezzo corrente.
+    """
+    try:
+        # Legge solo la colonna STATO (meno quote)
+        stato_col = ws_trade.col_values(H["stato"])  # include header
+        n_open = 0
+        if len(stato_col) > 1:
+            n_open = sum(1 for s in stato_col[1:] if (s or "").strip().upper() == "APERTO")
+
+        to_open = max(0, min_trades - n_open)
+        if to_open <= 0:
+            return
+
+        # Apre i mancanti
+        for i in range(to_open):
+            trade_id = f"{SYMBOL}-{int(time.time())}-AUTO{i}"
+            try:
+                open_new_trade(ws_trade, ws_log,
+                               trade_id=trade_id,
+                               side=side,
+                               qty=qty,
+                               H=H,
+                               col_ping=col_ping)
+                log(ws_log, "INFO",
+                    f"Aperto trade automatico {trade_id} per mantenere minimo {min_trades}")
+            except Exception as e:
+                log(ws_log, "ERROR",
+                    f"Apertura trade automatico fallita ({trade_id}): {e}")
+                # continua comunque ad aprire gli altri
+    except Exception as e:
+        log(ws_log, "ERROR", f"ensure_min_open_trades error: {e}")
 
 def main_loop():
     global _H_CACHE, _COL_PING_CACHE, _LAST_RECONCILE_TS
@@ -582,24 +622,34 @@ def main_loop():
             log(ws_log,"ERROR",f"Apertura automatica fallita: {e}")
 
     while True:
-        try:
-            # Riconcilia SOLO ogni RECONCILE_MIN_SECONDS
-            if time.time() - _LAST_RECONCILE_TS >= RECONCILE_MIN_SECONDS:
-                reconcile_and_notify_starts(ws_trade, ws_log, SYMBOL)
-                _LAST_RECONCILE_TS = time.time()
+    try:
+        # Riconcilia SOLO ogni RECONCILE_MIN_SECONDS
+        if time.time() - _LAST_RECONCILE_TS >= RECONCILE_MIN_SECONDS:
+            reconcile_and_notify_starts(ws_trade, ws_log, SYMBOL)
+            _LAST_RECONCILE_TS = time.time()
 
-            # Aggiornamento leggero sulle righe (colonne minime)
-            update_open_rows_light(ws_trade, ws_log, client, _H_CACHE, _COL_PING_CACHE)
+        # Aggiornamento leggero sulle righe (colonne minime)
+        update_open_rows_light(ws_trade, ws_log, client, _H_CACHE, _COL_PING_CACHE)
 
-            # Heartbeat log (throttled)
-            lastp = get_last_price(client)
-            if lastp != 0 and should_log_heartbeat(lastp):
-                log(ws_log, "INFO", f"Heartbeat OK - {fmt_dec(lastp)}")
+        # Mantieni almeno MIN_OPEN_TRADES trade APERTI
+        ensure_min_open_trades(
+            ws_trade, ws_log,
+            H=_H_CACHE,
+            col_ping=_COL_PING_CACHE,
+            min_trades=MIN_OPEN_TRADES,   # es. 5
+            side=AUTO_TRADE_SIDE.upper(), # es. LONG
+            qty=DEFAULT_QTY               # es. 1
+        )
 
-        except Exception as e:
-            log(ws_log,"ERROR",str(e))
+        # Heartbeat log (throttled)
+        lastp = get_last_price(client)
+        if lastp != 0 and should_log_heartbeat(lastp):
+            log(ws_log, "INFO", f"Heartbeat OK - {fmt_dec(lastp)}")
 
-        time.sleep(POLL_SECONDS)
+    except Exception as e:
+        log(ws_log, "ERROR", str(e))
+
+    time.sleep(POLL_SECONDS)
 
 
 if __name__ == "__main__":
