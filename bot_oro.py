@@ -399,11 +399,12 @@ def update_open_rows_light(ws_trade, ws_log, client, H, col_ping):
     - 1 read per 'stato' per capire quante righe ci sono
     - se nessuna riga -> aggiorna solo K2
     - altrimenti, legge solo le colonne richieste (entry/lato/qty/close) una volta per tutte
+    - aggiorna Delta (se la colonna 'Delta' esiste), P&L % e P&L valore ad ogni ping
     """
     nowloc = now_local_str()
     lastp = get_last_price(client)
     if lastp == 0:
-        log(ws_log,"WARN","Prezzo 0 da Binance")
+        log(ws_log, "WARN", "Prezzo 0 da Binance")
         return
 
     # 1) leggi solo colonna STATO (riduce letture)
@@ -421,28 +422,28 @@ def update_open_rows_light(ws_trade, ws_log, client, H, col_ping):
     end_row = start_row + n_rows - 1
 
     # Aggiorna 'Ultimo ping' per TUTTE le righe presenti (scrittura batch)
-    ping_updates = []
+    updates = []
     for r in range(start_row, end_row + 1):
-        ping_updates.append({
+        updates.append({
             "range": gspread.utils.rowcol_to_a1(r, col_ping),
             "values": [[f"{nowloc} - {fmt_dec(lastp)}"]],
         })
 
     # 2) leggi colonne minime per P&L/chiusure (UNA LETTURA per colonna)
-    # Nota: col_values allinea per indice, quindi usiamo stessa lunghezza
-    side_col = ws_trade.col_values(H.get("lato", 0)) if H.get("lato") else []
+    side_col  = ws_trade.col_values(H["lato"]) if "lato" in H else []
     entry_col = ws_trade.col_values(H["prezzo ingresso"])
-    qty_col = ws_trade.col_values(H.get("qty", 0)) if H.get("qty") else []
-    close_col = ws_trade.col_values(H.get("prezzo chiusura", 0)) if H.get("prezzo chiusura") else []
-    plpct_col_idx = H["p&l %"]
-    plval_col_idx = H["p&l valore"]
+    qty_col   = ws_trade.col_values(H["qty"])  if "qty" in H  else []
+    close_col = ws_trade.col_values(H["prezzo chiusura"]) if "prezzo chiusura" in H else []
+
+    plpct_col_idx  = H["p&l %"]
+    plval_col_idx  = H["p&l valore"]
     equity_col_idx = H["equity post-trade"]
-    note_col_idx = H.get("note")
-    stato_col_idx = H["stato"]
-    close_col_idx = H.get("prezzo chiusura")
+    note_col_idx   = H.get("note")
+    stato_col_idx  = H["stato"]
+    close_col_idx  = H.get("prezzo chiusura")
+    delta_col_idx  = H.get("delta")  # opzionale
 
-    updates = ping_updates  # partiamo con i ping
-
+    # Loop sulle righe dati
     for i in range(n_rows):
         r = start_row + i
         stato = (stato_col[i+1] if i+1 < len(stato_col) else "").strip().upper()
@@ -458,52 +459,56 @@ def update_open_rows_light(ws_trade, ws_log, client, H, col_ping):
             continue
 
         tp1, tp2, sl = compute_targets(entry)
-        hit = None; close_price = None
+        hit = None
+        close_price = None
         if side == "LONG":
             if lastp >= tp2: hit, close_price = "TP2", tp2
             elif lastp >= tp1: hit, close_price = "TP1", tp1
-            elif lastp <= sl: hit, close_price = "SL", sl
+            elif lastp <= sl:  hit, close_price = "SL",  sl
         else:
             if lastp <= tp2: hit, close_price = "TP2", tp2
             elif lastp <= tp1: hit, close_price = "TP1", tp1
-            elif lastp >= sl: hit, close_price = "SL", sl
+            elif lastp >= sl:  hit, close_price = "SL",  sl
 
         if not hit:
-    # P&L % e P&L valore (guadagno/perdita istantanei)
-    pnl_pct, pnl_val = pnl_values(side, entry, lastp, qty)
+            # P&L % e P&L valore (guadagno/perdita istantanei)
+            pnl_pct, pnl_val = pnl_values(side, entry, lastp, qty)
 
-    # Delta prezzo istantaneo (Last - Entry per LONG, Entry - Last per SHORT)
-    delta_price = (lastp - entry) if side == "LONG" else (entry - lastp)
+            # Delta prezzo istantaneo (Last - Entry per LONG, Entry - Last per SHORT)
+            delta_price = (lastp - entry) if side == "LONG" else (entry - lastp)
 
-    row_updates = [
-        {"range": gspread.utils.rowcol_to_a1(r, plpct_col_idx), "values": [[fmt_dec(pnl_pct, "0.0001")]]},
-        {"range": gspread.utils.rowcol_to_a1(r, plval_col_idx), "values": [[fmt_dec(pnl_val, "0.01")]]},
-    ]
+            row_updates = [
+                {"range": gspread.utils.rowcol_to_a1(r, plpct_col_idx), "values": [[fmt_dec(pnl_pct, "0.0001")]]},
+                {"range": gspread.utils.rowcol_to_a1(r, plval_col_idx), "values": [[fmt_dec(pnl_val, "0.01")]]},
+            ]
 
-    # Se esiste la colonna Delta, aggiorna anche la differenza di prezzo
-    if "delta" in H:
-        row_updates.append({
-            "range": gspread.utils.rowcol_to_a1(r, H["delta"]),
-            "values": [[fmt_dec(delta_price, "0.01")]]
-        })
+            # Se esiste la colonna Delta, aggiorna anche la differenza di prezzo
+            if delta_col_idx:
+                row_updates.append({
+                    "range": gspread.utils.rowcol_to_a1(r, delta_col_idx),
+                    "values": [[fmt_dec(delta_price, "0.01")]]
+                })
 
-    updates += row_updates
-    continue
+            updates += row_updates
+            continue
 
-        # CHIUSURA
+        # Qui: colpito TP/SL -> CHIUSURA
         pnl_pct, pnl_val = pnl_values(side, entry, close_price, qty)
         eq_prev = last_equity(ws_trade, equity_col_idx)
         eq_new  = eq_prev + pnl_val
 
         if close_col_idx:
-            updates.append({"range": gspread.utils.rowcol_to_a1(r, close_col_idx), "values": [[fmt_dec(close_price)]]})
-        updates.append({"range": gspread.utils.rowcol_to_a1(r, stato_col_idx), "values": [["CHIUSO"]]})
+            updates.append({"range": gspread.utils.rowcol_to_a1(r, close_col_idx),
+                            "values": [[fmt_dec(close_price)]]})
+        updates.append({"range": gspread.utils.rowcol_to_a1(r, stato_col_idx),
+                        "values": [["CHIUSO"]]})
         if note_col_idx:
-            updates.append({"range": gspread.utils.rowcol_to_a1(r, note_col_idx), "values": [[hit]]})
+            updates.append({"range": gspread.utils.rowcol_to_a1(r, note_col_idx),
+                            "values": [[hit]]})
         updates += [
-            {"range": gspread.utils.rowcol_to_a1(r, plpct_col_idx), "values": [[fmt_dec(pnl_pct,"0.0001")]]},
-            {"range": gspread.utils.rowcol_to_a1(r, plval_col_idx), "values": [[fmt_dec(pnl_val,"0.01")]]},
-            {"range": gspread.utils.rowcol_to_a1(r, equity_col_idx), "values": [[fmt_dec(eq_new,"0.01")]]},
+            {"range": gspread.utils.rowcol_to_a1(r, plpct_col_idx), "values": [[fmt_dec(pnl_pct, "0.0001")]]},
+            {"range": gspread.utils.rowcol_to_a1(r, plval_col_idx), "values": [[fmt_dec(pnl_val, "0.01")]]},
+            {"range": gspread.utils.rowcol_to_a1(r, equity_col_idx), "values": [[fmt_dec(eq_new, "0.01")]]},
         ]
 
         notify(
@@ -515,7 +520,7 @@ def update_open_rows_light(ws_trade, ws_log, client, H, col_ping):
         )
 
     if updates:
-        ws_trade.spreadsheet.values_batch_update({"valueInputOption":"USER_ENTERED","data":updates})
+        ws_trade.spreadsheet.values_batch_update({"valueInputOption": "USER_ENTERED", "data": updates})
 
 
 def open_new_trade(ws_trade, ws_log, trade_id: str, side="LONG", qty=Decimal("1"), H=None, col_ping=None):
