@@ -600,9 +600,12 @@ def ensure_min_open_trades(ws_trade, ws_log, H, col_ping,
 
 def main_loop():
     global _H_CACHE, _COL_PING_CACHE, _LAST_RECONCILE_TS
+
+    # Apri i fogli usando SOLO le ENV (nessun file locale)
     ws_trade, ws_log = open_sheets()
     client = binance_client()
-    log(ws_log,"INFO",f"Bot Oro avviato · Trade='{ws_trade.title}', Log='{ws_log.title}' · TZ={TIMEZONE}")
+    log(ws_log, "INFO",
+        f"Bot Oro avviato · Trade='{ws_trade.title}', Log='{ws_log.title}' · TZ={TIMEZONE}")
 
     # Header/mapping una sola volta
     header = get_header(ws_trade)
@@ -615,50 +618,48 @@ def main_loop():
     reconcile_and_notify_starts(ws_trade, ws_log, SYMBOL)
     _LAST_RECONCILE_TS = time.time()
 
+    # Apertura singola opzionale all'avvio
     if AUTO_OPEN_ON_START:
         try:
-            open_new_trade(ws_trade, ws_log, trade_id=f"{SYMBOL}-{int(time.time())}-A", side="LONG", H=_H_CACHE, col_ping=_COL_PING_CACHE)
+            open_new_trade(
+                ws_trade, ws_log,
+                trade_id=f"{SYMBOL}-{int(time.time())}-A",
+                side="LONG", H=_H_CACHE, col_ping=_COL_PING_CACHE
+            )
         except Exception as e:
-            log(ws_log,"ERROR",f"Apertura automatica fallita: {e}")
-            
-# === Apertura Google Sheet ===
-gc = gspread.service_account(filename="google_credentials.json")
-sh = gc.open_by_key(SPREADSHEET_ID)
+            log(ws_log, "ERROR", f"Apertura automatica fallita: {e}")
 
-ws_trade = sh.worksheet("TRADE")   # foglio principale
-ws_log   = sh.worksheet("LOG")     # foglio dei log
+    # ===== LOOP PRINCIPALE =====
+    while True:
+        try:
+            # Riconcilia SOLO ogni RECONCILE_MIN_SECONDS
+            if time.time() - _LAST_RECONCILE_TS >= RECONCILE_MIN_SECONDS:
+                reconcile_and_notify_starts(ws_trade, ws_log, SYMBOL)
+                _LAST_RECONCILE_TS = time.time()
 
+            # Aggiornamento leggero sulle righe (colonne minime)
+            update_open_rows_light(ws_trade, ws_log, client, _H_CACHE, _COL_PING_CACHE)
 
-while True:
-    try:
-        # Riconcilia SOLO ogni RECONCILE_MIN_SECONDS
-        if time.time() - _LAST_RECONCILE_TS >= RECONCILE_MIN_SECONDS:
-            reconcile_and_notify_starts(ws_trade, ws_log, SYMBOL)
-            _LAST_RECONCILE_TS = time.time()
+            # Mantieni almeno MIN_OPEN_TRADES trade APERTI
+            ensure_min_open_trades(
+                ws_trade, ws_log,
+                H=_H_CACHE,
+                col_ping=_COL_PING_CACHE,
+                min_trades=MIN_OPEN_TRADES,
+                side=AUTO_TRADE_SIDE.upper(),
+                qty=DEFAULT_QTY
+            )
 
-        # Aggiornamento leggero sulle righe (colonne minime)
-        update_open_rows_light(ws_trade, ws_log, client, _H_CACHE, _COL_PING_CACHE)
+            # Heartbeat log (throttled)
+            lastp = get_last_price(client)
+            if lastp != 0 and should_log_heartbeat(lastp):
+                log(ws_log, "INFO", f"Heartbeat OK - {fmt_dec(lastp)}")
 
-        # Mantieni almeno MIN_OPEN_TRADES trade APERTI
-        ensure_min_open_trades(
-            ws_trade, ws_log,
-            H=_H_CACHE,
-            col_ping=_COL_PING_CACHE,
-            min_trades=MIN_OPEN_TRADES,
-            side=AUTO_TRADE_SIDE.upper(),
-            qty=DEFAULT_QTY
-        )
+        except Exception as e:
+            log(ws_log, "ERROR", str(e))
 
-        # Heartbeat log
-        lastp = get_last_price(client)
-        if lastp != 0 and should_log_heartbeat(lastp):
-            log(ws_log, "INFO", f"Heartbeat OK - {fmt_dec(lastp)}")
+        time.sleep(POLL_SECONDS)
 
-    except Exception as e:
-        log(ws_log, "ERROR", str(e))
-
-    # aspetta un po’ prima del ciclo successivo
-    time.sleep(POLL_SECONDS)
 
 if __name__ == "__main__":
     main_loop()
