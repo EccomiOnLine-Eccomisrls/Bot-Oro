@@ -636,12 +636,12 @@ def main_loop():
             ws_trade, ws_log,
             H=_H_CACHE,
             col_ping=_COL_PING_CACHE,
-            min_trades=MIN_OPEN_TRADES,   # es. 5
-            side=AUTO_TRADE_SIDE.upper(), # es. LONG
-            qty=DEFAULT_QTY               # es. 1
+            min_trades=MIN_OPEN_TRADES,
+            side=AUTO_TRADE_SIDE.upper(),
+            qty=DEFAULT_QTY
         )
 
-        # Heartbeat log (throttled)
+        # Heartbeat log
         lastp = get_last_price(client)
         if lastp != 0 and should_log_heartbeat(lastp):
             log(ws_log, "INFO", f"Heartbeat OK - {fmt_dec(lastp)}")
