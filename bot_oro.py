@@ -621,7 +621,7 @@ def main_loop():
         except Exception as e:
             log(ws_log,"ERROR",f"Apertura automatica fallita: {e}")
 
-    while True:
+while True:
     try:
         # Riconcilia SOLO ogni RECONCILE_MIN_SECONDS
         if time.time() - _LAST_RECONCILE_TS >= RECONCILE_MIN_SECONDS:
@@ -649,8 +649,8 @@ def main_loop():
     except Exception as e:
         log(ws_log, "ERROR", str(e))
 
+    # aspetta un po’ prima del ciclo successivo
     time.sleep(POLL_SECONDS)
-
 
 if __name__ == "__main__":
     main_loop()
