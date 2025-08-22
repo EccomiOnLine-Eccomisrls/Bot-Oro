@@ -620,6 +620,14 @@ def main_loop():
             open_new_trade(ws_trade, ws_log, trade_id=f"{SYMBOL}-{int(time.time())}-A", side="LONG", H=_H_CACHE, col_ping=_COL_PING_CACHE)
         except Exception as e:
             log(ws_log,"ERROR",f"Apertura automatica fallita: {e}")
+            
+# === Apertura Google Sheet ===
+gc = gspread.service_account(filename="google_credentials.json")
+sh = gc.open_by_key(SPREADSHEET_ID)
+
+ws_trade = sh.worksheet("TRADE")   # foglio principale
+ws_log   = sh.worksheet("LOG")     # foglio dei log
+
 
 while True:
     try:
