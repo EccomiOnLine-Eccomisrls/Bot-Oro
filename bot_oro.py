@@ -1,12 +1,15 @@
 import os, json, time, unicodedata, requests
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
+from decimal import Decimal, ROUND_HALF_UP
 
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from binance.client import Client as BinanceClient
 from binance.exceptions import BinanceAPIException, BinanceRequestException
 from twilio.rest import Client as TwilioClient
+
+# ========= COSTANTI =========
+BOT_VERSION = "oro-bot v1.3"
 
 # ========= ENV =========
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
@@ -32,30 +35,34 @@ TWILIO_TO   = os.getenv("TWILIO_TO", "")
 
 # Telegram (opzionale)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")  # -100... per canali/gruppi oppure ID utente
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "8"))
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Rome")
-AUTO_OPEN_ON_START = os.getenv("AUTO_OPEN_ON_START", "0") == "1"  # se 1, apre 1 trade all'avvio
+AUTO_OPEN_ON_START = os.getenv("AUTO_OPEN_ON_START", "0") == "1"
 
 # Auto-apertura continua per mantenere almeno N trade
-MIN_OPEN_TRADES = int(os.getenv("MIN_OPEN_TRADES", "5"))   # minimo trades APERTI da mantenere
-AUTO_TRADE_SIDE = os.getenv("AUTO_TRADE_SIDE", "LONG")      # lato predefinito (LONG/SHORT)
-DEFAULT_QTY     = Decimal(os.getenv("DEFAULT_QTY", "1"))    # qty predefinito
+MIN_OPEN_TRADES = int(os.getenv("MIN_OPEN_TRADES", "5"))
+AUTO_TRADE_SIDE = os.getenv("AUTO_TRADE_SIDE", "LONG")
+DEFAULT_QTY     = Decimal(os.getenv("DEFAULT_QTY", "1"))
 
 # Debug / throttle log
 DEBUG_HEADERS = os.getenv("DEBUG_HEADERS", "0") == "1"
-HEARTBEAT_MIN_SECONDS = int(os.getenv("HEARTBEAT_MIN_SECONDS", "60"))  # scrivi heartbeat log ogni X s minimo
-HEARTBEAT_PRICE_DELTA_BP = int(os.getenv("HEARTBEAT_PRICE_DELTA_BP", "2"))  # basis points (2 = 0.02%)
+HEARTBEAT_MIN_SECONDS = int(os.getenv("HEARTBEAT_MIN_SECONDS", "60"))
+HEARTBEAT_PRICE_DELTA_BP = int(os.getenv("HEARTBEAT_PRICE_DELTA_BP", "2"))
 
 # Riconciliazione meno frequente (per ridurre letture)
 RECONCILE_MIN_SECONDS = int(os.getenv("RECONCILE_MIN_SECONDS", "180"))
 
-# Stato interno per throttling
+# Stato interno
 _LAST_HEADER_SIG = None
 _LAST_HEARTBEAT_TS = 0
 _LAST_HEARTBEAT_PRICE = None
 _LAST_RECONCILE_TS = 0
+
+# Throttle per log "nessuna chiusura"
+_LAST_MISS_LOG_TS = 0
+MISS_LOG_EVERY = 30  # secondi
 
 # Cache header/mapping
 _H_CACHE = None
@@ -64,40 +71,24 @@ _COL_PING_CACHE = None
 
 # ========= UTILS =========
 def d(x) -> Decimal:
-    """
-    Converte stringhe stile IT/EN in Decimal:
-    - '2345,67' -> 2345.67
-    - '0,02%'   -> 0.0002
-    """
-    if isinstance(x, Decimal):
-        return x
-    if x is None:
-        return Decimal("0")
+    if isinstance(x, Decimal): return x
+    if x is None: return Decimal("0")
     s = str(x).strip()
-    if not s:
-        return Decimal("0")
-
+    if not s: return Decimal("0")
     is_percent = False
     if s.endswith("%"):
         is_percent = True
         s = s[:-1].strip()
-
     s = s.replace(" ", "")
-
-    # se contiene sia . che , => interpreto , come decimale
     if "." in s and "," in s:
-        s = s.replace(".", "")
-        s = s.replace(",", ".")
+        s = s.replace(".", "").replace(",", ".")
     elif "," in s:
         s = s.replace(",", ".")
-
     try:
         val = Decimal(s)
     except:
         return Decimal("0")
-
-    if is_percent:
-        val = val / Decimal("100")
+    if is_percent: val = val / Decimal("100")
     return val
 
 def fmt_dec(x: Decimal, q="0.00001") -> str:
@@ -108,7 +99,6 @@ def _zone():
         from zoneinfo import ZoneInfo
         return ZoneInfo(TIMEZONE)
     except Exception:
-        # fallback: UTC se tz mancante
         return timezone.utc
 
 def now_local_str() -> str:
@@ -139,7 +129,6 @@ def send_telegram(msg: str):
         print(f"[TELEGRAM] {e}")
 
 def notify(msg: str):
-    # prima Telegram, poi WhatsApp (se abilitato)
     send_telegram(msg)
     send_whatsapp(msg)
 
@@ -160,7 +149,6 @@ def open_sheets():
     sh = gc.open_by_key(SPREADSHEET_ID)
     return open_ws_by_title(sh, SHEET_TAB_TRADE), open_ws_by_title(sh, SHEET_TAB_LOG)
 
-# === Alias più tolleranti ===
 ALIAS = {
     "data/ora": ["data ora","timestamp","datetime","dataora","data"],
     "id trade": ["id","trade id","ordine id"],
@@ -188,6 +176,7 @@ def build_header_map(header_row):
             if n==norm(canon) or n in [norm(a) for a in alts]:
                 H[canon]=idx; break
     return H
+
 def get_header(ws):
     header=ws.row_values(1)
     if not header: raise RuntimeError(f"La tab '{ws.title}' non ha intestazioni.")
@@ -197,10 +186,8 @@ def header_signature(header_row):
     return "|".join([h.strip().lower() for h in header_row])
 
 def dump_headers_once(ws_trade, ws_log):
-    """Logga gli header solo se cambiano e solo se DEBUG_HEADERS=1."""
     global _LAST_HEADER_SIG
-    if not DEBUG_HEADERS:
-        return
+    if not DEBUG_HEADERS: return
     header = ws_trade.row_values(1)
     sig = header_signature(header)
     if sig != _LAST_HEADER_SIG:
@@ -214,8 +201,7 @@ def dump_headers_once(ws_trade, ws_log):
 
 def find_col_by_header(ws, header_name: str) -> int:
     header = ws.row_values(1)
-    if not header:
-        raise RuntimeError(f"La tab '{ws.title}' non ha intestazioni.")
+    if not header: raise RuntimeError(f"La tab '{ws.title}' non ha intestazioni.")
     target = (header_name or "").strip().lower()
     for i, h in enumerate(header, start=1):
         if (h or "").strip().lower() == target:
@@ -226,6 +212,7 @@ def find_col_by_header(ws, header_name: str) -> int:
 # ========= BINANCE =========
 def binance_client():
     return BinanceClient(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
+
 def get_last_price(client) -> Decimal:
     try:
         p=client.get_symbol_ticker(symbol=SYMBOL)
@@ -237,6 +224,7 @@ def get_last_price(client) -> Decimal:
 # ========= LOGICA =========
 def compute_targets(entry: Decimal):
     return (entry*(1+TP1_PCT), entry*(1+TP2_PCT), entry*(1-SL_PCT))
+
 def pnl_values(side, entry, close, qty):
     if qty==0 or entry==0 or close==0: return (Decimal("0"), Decimal("0"))
     if side.upper()=="LONG":
@@ -248,34 +236,24 @@ def pnl_values(side, entry, close, qty):
 # ========= SUPPORTO START/REPAIR =========
 def log_get_messages(ws_log, max_rows=2000):
     try:
-        msgs = ws_log.col_values(3)  # colonna 'msg'
-        if len(msgs) <= 1:
-            return set()
+        msgs = ws_log.col_values(3)
+        if len(msgs) <= 1: return set()
         return set(msgs[-max_rows:])
     except Exception:
         return set()
 
 def start_already_notified(log_msgs: set, trade_id: str) -> bool:
-    if not trade_id:
-        return False
+    if not trade_id: return False
     key = f"Aperto trade {trade_id}"
     for m in log_msgs:
-        if trade_id in m and "Aperto trade" in m:
-            return True
-        if key in m:
-            return True
+        if trade_id in m and "Aperto trade" in m: return True
+        if key in m: return True
     return False
 
 def gen_trade_id(symbol: str, row_index: int) -> str:
     return f"{symbol}-{int(time.time())}-R{row_index}"
 
 def reconcile_and_notify_starts(ws_trade, ws_log, symbol: str):
-    """
-    - Se 'Prezzo chiusura' è pieno e 'Stato' è vuoto/APERTO -> CHIUSO.
-    - Se 'Prezzo ingresso' (cella NON vuota) e 'Stato' è vuoto -> APERTO.
-    - Se APERTO ma manca 'ID trade' -> genera ID.
-    - Se riga APERTA appena riconosciuta -> invia messaggio START (una sola volta).
-    """
     header = get_header(ws_trade)
     H = build_header_map(header)
 
@@ -284,18 +262,12 @@ def reconcile_and_notify_starts(ws_trade, ws_log, symbol: str):
         if k not in H:
             raise RuntimeError(f"Manca colonna '{k}' nella tab '{ws_trade.title}'.")
 
-    L_ID = H["id trade"]
-    L_STATO = H["stato"]
-    L_LATO = H["lato"]
-    L_ENTRY = H["prezzo ingresso"]
-    L_CLOSE = H.get("prezzo chiusura")
-    L_TP1 = H.get("tp1 %")
-    L_TP2 = H.get("tp2 %")
-    L_SL  = H.get("sl %")
+    L_ID = H["id trade"]; L_STATO = H["stato"]; L_LATO = H["lato"]
+    L_ENTRY = H["prezzo ingresso"]; L_CLOSE = H.get("prezzo chiusura")
+    L_TP1 = H.get("tp1 %"); L_TP2 = H.get("tp2 %"); L_SL = H.get("sl %")
 
     rows = ws_trade.get_all_values()
-    if len(rows) <= 1:
-        return
+    if len(rows) <= 1: return
 
     log_msgs = log_get_messages(ws_log)
     updates = []
@@ -310,31 +282,18 @@ def reconcile_and_notify_starts(ws_trade, ws_log, symbol: str):
         close_str = (row[L_CLOSE - 1] if L_CLOSE and len(row) >= L_CLOSE else "").strip()
         has_close = bool(close_str)
 
-        # Se ha un prezzo di chiusura ma non è segnato chiuso -> chiudi
         if has_close and stato in ("", "APERTO"):
-            updates.append({
-                "range": gspread.utils.rowcol_to_a1(r, L_STATO),
-                "values": [["CHIUSO"]]
-            })
+            updates.append({"range": gspread.utils.rowcol_to_a1(r, L_STATO), "values": [["CHIUSO"]]})
             stato = "CHIUSO"
 
-        # Se la cella entry NON è vuota e lo stato è vuoto -> APERTO
         if entry_str and stato == "":
-            updates.append({
-                "range": gspread.utils.rowcol_to_a1(r, L_STATO),
-                "values": [["APERTO"]]
-            })
+            updates.append({"range": gspread.utils.rowcol_to_a1(r, L_STATO), "values": [["APERTO"]]})
             stato = "APERTO"
 
-        # Genera ID se manca su riga APERTA
         if stato == "APERTO" and not trade_id:
             trade_id = gen_trade_id(symbol, r)
-            updates.append({
-                "range": gspread.utils.rowcol_to_a1(r, L_ID),
-                "values": [[trade_id]]
-            })
+            updates.append({"range": gspread.utils.rowcol_to_a1(r, L_ID), "values": [[trade_id]]})
 
-        # START una sola volta
         if stato == "APERTO" and entry > 0 and not start_already_notified(log_msgs, trade_id):
             TP1 = d(row[L_TP1 - 1]) if L_TP1 and len(row) >= L_TP1 and (row[L_TP1 - 1] or "").strip() else TP1_PCT
             TP2 = d(row[L_TP2 - 1]) if L_TP2 and len(row) >= L_TP2 and (row[L_TP2 - 1] or "").strip() else TP2_PCT
@@ -374,59 +333,46 @@ def log(ws_log, level, msg):
         print(f"[LOG] {level}: {msg} ({e})")
 
 def should_log_heartbeat(price: Decimal) -> bool:
-    """Decide se scrivere la riga 'Heartbeat OK - price' per evitare spam."""
     global _LAST_HEARTBEAT_TS, _LAST_HEARTBEAT_PRICE
     now_ts = time.time()
     if _LAST_HEARTBEAT_TS == 0 or _LAST_HEARTBEAT_PRICE is None:
-        _LAST_HEARTBEAT_TS = now_ts
-        _LAST_HEARTBEAT_PRICE = price
+        _LAST_HEARTBEAT_TS = now_ts; _LAST_HEARTBEAT_PRICE = price
         return True
-    # tempo
     if now_ts - _LAST_HEARTBEAT_TS >= HEARTBEAT_MIN_SECONDS:
-        _LAST_HEARTBEAT_TS = now_ts
-        _LAST_HEARTBEAT_PRICE = price
+        _LAST_HEARTBEAT_TS = now_ts; _LAST_HEARTBEAT_PRICE = price
         return True
-    # delta prezzo in basis points
     try:
         if price > 0 and _LAST_HEARTBEAT_PRICE > 0:
             move_bp = abs((price - _LAST_HEARTBEAT_PRICE) / _LAST_HEARTBEAT_PRICE) * 10000
             if move_bp >= HEARTBEAT_PRICE_DELTA_BP:
-                _LAST_HEARTBEAT_TS = now_ts
-                _LAST_HEARTBEAT_PRICE = price
+                _LAST_HEARTBEAT_TS = now_ts; _LAST_HEARTBEAT_PRICE = price
                 return True
     except Exception:
         pass
     return False
 
 def update_open_rows_light(ws_trade, ws_log, client, H, col_ping):
-    """
-    Versione "leggera": legge solo le colonne necessarie.
-    - 1 read per 'stato' per capire quante righe ci sono
-    - se nessuna riga -> aggiorna solo K2
-    - altrimenti, legge solo le colonne richieste (entry/lato/qty/close) una volta per tutte
-    - aggiorna Delta (se la colonna 'Delta' esiste), P&L % e P&L valore ad ogni ping
-    """
     nowloc = now_local_str()
     lastp = get_last_price(client)
     if lastp == 0:
         log(ws_log, "WARN", "Prezzo 0 da Binance")
         return
 
-    # 1) leggi solo colonna STATO (riduce letture)
-    stato_col = ws_trade.col_values(H["stato"])  # include header in posizione 1
+    stato_col = ws_trade.col_values(H["stato"])
     if len(stato_col) <= 1:
-        # solo header -> aggiorna K2 e stop
         try:
             ws_trade.update_cell(2, col_ping, f"{nowloc} - {fmt_dec(lastp)}")
         except Exception as e:
             log(ws_log, "ERROR", f"[DEBUG] update_cell K2 fallito: {e}")
         return
 
-    n_rows = len(stato_col) - 1  # escludi header
+    n_rows = len(stato_col) - 1
     start_row = 2
     end_row = start_row + n_rows - 1
 
-    # Aggiorna 'Ultimo ping' per TUTTE le righe presenti (scrittura batch)
+    # (B) Ping sintetico
+    log(ws_log, "DEBUG", f"Ping @ {fmt_dec(lastp)} · righe={n_rows} · stato_col_len={len(stato_col)}")
+
     updates = []
     for r in range(start_row, end_row + 1):
         updates.append({
@@ -434,7 +380,6 @@ def update_open_rows_light(ws_trade, ws_log, client, H, col_ping):
             "values": [[f"{nowloc} - {fmt_dec(lastp)}"]],
         })
 
-    # 2) leggi colonne minime per P&L/chiusure (UNA LETTURA per colonna)
     side_col  = ws_trade.col_values(H["lato"]) if "lato" in H else []
     entry_col = ws_trade.col_values(H["prezzo ingresso"])
     qty_col   = ws_trade.col_values(H["qty"])  if "qty" in H  else []
@@ -446,9 +391,10 @@ def update_open_rows_light(ws_trade, ws_log, client, H, col_ping):
     note_col_idx   = H.get("note")
     stato_col_idx  = H["stato"]
     close_col_idx  = H.get("prezzo chiusura")
-    delta_col_idx  = H.get("delta")  # opzionale
+    delta_col_idx  = H.get("delta")
 
-    # Loop sulle righe dati
+    global _LAST_MISS_LOG_TS
+
     for i in range(n_rows):
         r = start_row + i
         stato = (stato_col[i+1] if i+1 < len(stato_col) else "").strip().upper()
@@ -476,28 +422,29 @@ def update_open_rows_light(ws_trade, ws_log, client, H, col_ping):
             elif lastp >= sl:  hit, close_price = "SL",  sl
 
         if not hit:
-            # P&L % e P&L valore (guadagno/perdita istantanei)
             pnl_pct, pnl_val = pnl_values(side, entry, lastp, qty)
-
-            # Delta prezzo istantaneo (Last - Entry per LONG, Entry - Last per SHORT)
             delta_price = (lastp - entry) if side == "LONG" else (entry - lastp)
 
             row_updates = [
                 {"range": gspread.utils.rowcol_to_a1(r, plpct_col_idx), "values": [[fmt_dec(pnl_pct, "0.0001")]]},
                 {"range": gspread.utils.rowcol_to_a1(r, plval_col_idx), "values": [[fmt_dec(pnl_val, "0.01")]]},
             ]
-
-            # Se esiste la colonna Delta, aggiorna anche la differenza di prezzo
             if delta_col_idx:
                 row_updates.append({
                     "range": gspread.utils.rowcol_to_a1(r, delta_col_idx),
                     "values": [[fmt_dec(delta_price, "0.01")]]
                 })
-
             updates += row_updates
+
+            now_ts = time.time()
+            if now_ts - _LAST_MISS_LOG_TS >= MISS_LOG_EVERY:
+                _LAST_MISS_LOG_TS = now_ts
+                log(ws_log, "DEBUG",
+                    f"Nessuna chiusura r{r}: side={side} entry={fmt_dec(entry)} last={fmt_dec(lastp)} "
+                    f"tp1={fmt_dec(tp1)} tp2={fmt_dec(tp2)} sl={fmt_dec(sl)} qty={fmt_dec(qty,'0.00000001')}")
             continue
 
-        # Qui: colpito TP/SL -> CHIUSURA
+        # Chiusura
         pnl_pct, pnl_val = pnl_values(side, entry, close_price, qty)
         eq_prev = last_equity(ws_trade, equity_col_idx)
         eq_new  = eq_prev + pnl_val
@@ -515,6 +462,11 @@ def update_open_rows_light(ws_trade, ws_log, client, H, col_ping):
             {"range": gspread.utils.rowcol_to_a1(r, plval_col_idx), "values": [[fmt_dec(pnl_val, "0.01")]]},
             {"range": gspread.utils.rowcol_to_a1(r, equity_col_idx), "values": [[fmt_dec(eq_new, "0.01")]]},
         ]
+
+        log(ws_log, "INFO",
+            f"Close {hit} r{r} · side={side} entry={fmt_dec(entry)} "
+            f"close={fmt_dec(close_price)} pnl%={fmt_dec(pnl_pct,'0.0001')} "
+            f"pnl=${fmt_dec(pnl_val,'0.01')} eq->{fmt_dec(eq_new,'0.01')}")
 
         notify(
             f"⛏️ BOT ORO | {SYMBOL}\n"
@@ -564,83 +516,63 @@ def open_new_trade(ws_trade, ws_log, trade_id: str, side="LONG", qty=Decimal("1"
 
 def ensure_min_open_trades(ws_trade, ws_log, H, col_ping,
                            min_trades=5, side="LONG", qty=Decimal("1")):
-    """
-    Conta quanti trade sono APERTI e, se < min_trades, ne apre subito di nuovi
-    usando open_new_trade(...) con prezzo corrente.
-    """
     try:
-        # Legge solo la colonna STATO (meno quote)
-        stato_col = ws_trade.col_values(H["stato"])  # include header
+        stato_col = ws_trade.col_values(H["stato"])
         n_open = 0
         if len(stato_col) > 1:
             n_open = sum(1 for s in stato_col[1:] if (s or "").strip().upper() == "APERTO")
 
         to_open = max(0, min_trades - n_open)
-        if to_open <= 0:
-            return
+        if to_open <= 0: return
 
-        # Apre i mancanti
         for i in range(to_open):
             trade_id = f"{SYMBOL}-{int(time.time())}-AUTO{i}"
             try:
-                open_new_trade(ws_trade, ws_log,
-                               trade_id=trade_id,
-                               side=side,
-                               qty=qty,
-                               H=H,
-                               col_ping=col_ping)
-                log(ws_log, "INFO",
-                    f"Aperto trade automatico {trade_id} per mantenere minimo {min_trades}")
+                open_new_trade(ws_trade, ws_log, trade_id=trade_id, side=side, qty=qty, H=H, col_ping=col_ping)
+                log(ws_log, "INFO", f"Aperto trade automatico {trade_id} per mantenere minimo {min_trades}")
             except Exception as e:
-                log(ws_log, "ERROR",
-                    f"Apertura trade automatico fallita ({trade_id}): {e}")
-                # continua comunque ad aprire gli altri
+                log(ws_log, "ERROR", f"Apertura trade automatico fallita ({trade_id}): {e}")
     except Exception as e:
         log(ws_log, "ERROR", f"ensure_min_open_trades error: {e}")
 
 def main_loop():
     global _H_CACHE, _COL_PING_CACHE, _LAST_RECONCILE_TS
 
-    # Apri i fogli usando SOLO le ENV (nessun file locale)
     ws_trade, ws_log = open_sheets()
     client = binance_client()
-    log(ws_log, "INFO",
-        f"Bot Oro avviato · Trade='{ws_trade.title}', Log='{ws_log.title}' · TZ={TIMEZONE}")
 
-    # Header/mapping una sola volta
+    # (A) Startup con versione e parametri
+    log(ws_log, "INFO",
+        f"{BOT_VERSION} · SYMBOL={SYMBOL} · TZ={TIMEZONE} · "
+        f"TABS=({ws_trade.title},{ws_log.title}) · "
+        f"TP1={fmt_dec(TP1_PCT,'0.0000001')} TP2={fmt_dec(TP2_PCT,'0.0000001')} SL={fmt_dec(SL_PCT,'0.0000001')} · "
+        f"MIN_OPEN_TRADES={MIN_OPEN_TRADES} POLL={POLL_SECONDS}s")
+
     header = get_header(ws_trade)
     _H_CACHE = build_header_map(header)
     _COL_PING_CACHE = find_col_by_header(ws_trade, "Ultimo ping")
 
-    dump_headers_once(ws_trade, ws_log)  # solo se DEBUG_HEADERS=1
+    dump_headers_once(ws_trade, ws_log)
 
-    # Riconcilia una volta all'avvio
     reconcile_and_notify_starts(ws_trade, ws_log, SYMBOL)
     _LAST_RECONCILE_TS = time.time()
 
-    # Apertura singola opzionale all'avvio
     if AUTO_OPEN_ON_START:
         try:
-            open_new_trade(
-                ws_trade, ws_log,
-                trade_id=f"{SYMBOL}-{int(time.time())}-A",
-                side="LONG", H=_H_CACHE, col_ping=_COL_PING_CACHE
-            )
+            open_new_trade(ws_trade, ws_log,
+                           trade_id=f"{SYMBOL}-{int(time.time())}-A",
+                           side="LONG", H=_H_CACHE, col_ping=_COL_PING_CACHE)
         except Exception as e:
             log(ws_log, "ERROR", f"Apertura automatica fallita: {e}")
 
-    # ===== LOOP PRINCIPALE =====
     while True:
         try:
-            # Riconcilia SOLO ogni RECONCILE_MIN_SECONDS
             if time.time() - _LAST_RECONCILE_TS >= RECONCILE_MIN_SECONDS:
                 reconcile_and_notify_starts(ws_trade, ws_log, SYMBOL)
                 _LAST_RECONCILE_TS = time.time()
 
-            # Aggiornamento leggero sulle righe (colonne minime)
             update_open_rows_light(ws_trade, ws_log, client, _H_CACHE, _COL_PING_CACHE)
 
-            # Mantieni almeno MIN_OPEN_TRADES trade APERTI
             ensure_min_open_trades(
                 ws_trade, ws_log,
                 H=_H_CACHE,
@@ -650,7 +582,6 @@ def main_loop():
                 qty=DEFAULT_QTY
             )
 
-            # Heartbeat log (throttled)
             lastp = get_last_price(client)
             if lastp != 0 and should_log_heartbeat(lastp):
                 log(ws_log, "INFO", f"Heartbeat OK - {fmt_dec(lastp)}")
