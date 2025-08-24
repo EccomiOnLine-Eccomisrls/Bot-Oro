@@ -9,7 +9,7 @@ from binance.exceptions import BinanceAPIException, BinanceRequestException
 from twilio.rest import Client as TwilioClient
 
 # ========= COSTANTI =========
-BOT_VERSION = "oro-bot v1.3"
+BOT_VERSION = "oro-bot v1.4"
 
 # ========= ENV =========
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
@@ -54,6 +54,11 @@ HEARTBEAT_PRICE_DELTA_BP = int(os.getenv("HEARTBEAT_PRICE_DELTA_BP", "2"))
 # Riconciliazione meno frequente (per ridurre letture)
 RECONCILE_MIN_SECONDS = int(os.getenv("RECONCILE_MIN_SECONDS", "180"))
 
+# === Nuovi parametri anti-clustering ===
+MIN_TRADE_GAP_SECONDS = int(os.getenv("MIN_TRADE_GAP_SECONDS", "180"))  # cooldown temporale
+MIN_ENTRY_DISTANCE_BP = int(os.getenv("MIN_ENTRY_DISTANCE_BP", "12"))   # distanza minima da altri APERTI
+GRID_STEP_BP          = int(os.getenv("GRID_STEP_BP", "15"))            # passo minimo vs ultimo aperto (0=off)
+
 # Stato interno
 _LAST_HEADER_SIG = None
 _LAST_HEARTBEAT_TS = 0
@@ -67,6 +72,10 @@ MISS_LOG_EVERY = 30  # secondi
 # Cache header/mapping
 _H_CACHE = None
 _COL_PING_CACHE = None
+
+# Stato per anti-clustering
+_LAST_TRADE_TS = 0
+_LAST_ENTRY_PRICE = None
 
 
 # ========= UTILS =========
@@ -370,7 +379,7 @@ def update_open_rows_light(ws_trade, ws_log, client, H, col_ping):
     start_row = 2
     end_row = start_row + n_rows - 1
 
-    # (B) Ping sintetico
+    # Ping sintetico (utile a diagnosi frequenza ciclo)
     log(ws_log, "DEBUG", f"Ping @ {fmt_dec(lastp)} · righe={n_rows} · stato_col_len={len(stato_col)}")
 
     updates = []
@@ -480,14 +489,25 @@ def update_open_rows_light(ws_trade, ws_log, client, H, col_ping):
         ws_trade.spreadsheet.values_batch_update({"valueInputOption": "USER_ENTERED", "data": updates})
 
 
-def open_new_trade(ws_trade, ws_log, trade_id: str, side="LONG", qty=Decimal("1"), H=None, col_ping=None):
+def open_new_trade(ws_trade, ws_log, trade_id: str, side="LONG", qty=Decimal("1"),
+                   H=None, col_ping=None, entry_price: Decimal | None = None) -> Decimal:
+    """
+    Apre una riga trade e ritorna il prezzo di ingresso usato.
+    Se entry_price è passato, usa quello; altrimenti preleva da Binance.
+    """
     if H is None:
         header = get_header(ws_trade); H = build_header_map(header)
     need=["data/ora","id trade","lato","stato","prezzo ingresso","qty","sl %","tp1 %","tp2 %","ultimo ping"]
     for k in need:
         if k not in H: raise RuntimeError(f"Colonna '{k}' mancante per aprire un trade.")
-    price=get_last_price(binance_client())
-    if price==0: raise RuntimeError("Prezzo non disponibile per apertura trade.")
+
+    if entry_price is None:
+        price = get_last_price(binance_client())
+    else:
+        price = d(entry_price)
+
+    if price == 0:
+        raise RuntimeError("Prezzo non disponibile per apertura trade.")
 
     row=[""]*max(H.values())
     def setv(k,v): row[H[k]-1]=v
@@ -513,27 +533,89 @@ def open_new_trade(ws_trade, ws_log, trade_id: str, side="LONG", qty=Decimal("1"
            f"{TIMEZONE}")
     log(ws_log,"INFO",f"Aperto trade {trade_id} @ {fmt_dec(price)}")
     notify(msg)
+    return price
 
-def ensure_min_open_trades(ws_trade, ws_log, H, col_ping,
+
+def ensure_min_open_trades(ws_trade, ws_log, client, H, col_ping,
                            min_trades=5, side="LONG", qty=Decimal("1")):
+    """
+    Mantiene almeno min_trades APERTI, ma applica:
+    - Cooldown temporale MIN_TRADE_GAP_SECONDS
+    - Distanza minima dai trade APERTI in bps (MIN_ENTRY_DISTANCE_BP)
+    - Grid step rispetto all'ultimo aperto (GRID_STEP_BP)
+    """
+    global _LAST_TRADE_TS, _LAST_ENTRY_PRICE
     try:
-        stato_col = ws_trade.col_values(H["stato"])
+        stato_col = ws_trade.col_values(H["stato"])  # include header
         n_open = 0
         if len(stato_col) > 1:
             n_open = sum(1 for s in stato_col[1:] if (s or "").strip().upper() == "APERTO")
 
         to_open = max(0, min_trades - n_open)
-        if to_open <= 0: return
+        if to_open <= 0:
+            return
 
+        # --- filtri anti-clustering ---
+        now_ts = time.time()
+        if now_ts - _LAST_TRADE_TS < MIN_TRADE_GAP_SECONDS:
+            log(ws_log, "DEBUG", f"Skip open: cooldown attivo {int(now_ts - _LAST_TRADE_TS)}s < {MIN_TRADE_GAP_SECONDS}s")
+            return
+
+        lastp = get_last_price(client)
+        if lastp == 0:
+            log(ws_log, "WARN", "Prezzo 0 da Binance (skip open)")
+            return
+
+        # Distanza minima da altri APERTI
+        open_entries = []
+        entry_col = ws_trade.col_values(H["prezzo ingresso"])
+        if len(stato_col) > 1:
+            for i in range(1, len(stato_col)):
+                if (stato_col[i] or "").strip().upper() == "APERTO":
+                    v = (entry_col[i] if i < len(entry_col) else "").strip()
+                    if v:
+                        e = d(v)
+                        if e > 0:
+                            open_entries.append(e)
+
+        if MIN_ENTRY_DISTANCE_BP > 0 and open_entries:
+            too_close = any(abs((lastp - e) / e) * 10000 < MIN_ENTRY_DISTANCE_BP for e in open_entries)
+            if too_close:
+                log(ws_log, "DEBUG",
+                    f"Skip open: distanza < {MIN_ENTRY_DISTANCE_BP}bp da un entry aperto (last={fmt_dec(lastp)})")
+                return
+
+        # Grid step rispetto all'ultimo aperto
+        if GRID_STEP_BP > 0 and _LAST_ENTRY_PRICE:
+            move_bp = abs((lastp - _LAST_ENTRY_PRICE) / _LAST_ENTRY_PRICE) * 10000
+            if move_bp < GRID_STEP_BP:
+                log(ws_log, "DEBUG",
+                    f"Skip open: grid step {move_bp:.1f}bp < {GRID_STEP_BP}bp (ultimo={fmt_dec(_LAST_ENTRY_PRICE)} last={fmt_dec(lastp)})")
+                return
+
+        # --- apri i mancanti (in pratica ne passerà 1 per giro grazie ai filtri) ---
         for i in range(to_open):
             trade_id = f"{SYMBOL}-{int(time.time())}-AUTO{i}"
             try:
-                open_new_trade(ws_trade, ws_log, trade_id=trade_id, side=side, qty=qty, H=H, col_ping=col_ping)
-                log(ws_log, "INFO", f"Aperto trade automatico {trade_id} per mantenere minimo {min_trades}")
+                used_price = open_new_trade(ws_trade, ws_log,
+                                            trade_id=trade_id,
+                                            side=side,
+                                            qty=qty,
+                                            H=H,
+                                            col_ping=col_ping,
+                                            entry_price=lastp)
+                _LAST_TRADE_TS = now_ts
+                _LAST_ENTRY_PRICE = used_price
+                log(ws_log, "INFO",
+                    f"Aperto trade automatico {trade_id} (min={min_trades}) · price={fmt_dec(used_price)}")
+                # dopo il primo, gli altri verranno bloccati da cooldown/grid → break
+                break
             except Exception as e:
                 log(ws_log, "ERROR", f"Apertura trade automatico fallita ({trade_id}): {e}")
+                # continua a provare quello dopo (se i filtri lo consentono)
     except Exception as e:
         log(ws_log, "ERROR", f"ensure_min_open_trades error: {e}")
+
 
 def main_loop():
     global _H_CACHE, _COL_PING_CACHE, _LAST_RECONCILE_TS
@@ -541,12 +623,13 @@ def main_loop():
     ws_trade, ws_log = open_sheets()
     client = binance_client()
 
-    # (A) Startup con versione e parametri
+    # Startup log con versione e parametri principali
     log(ws_log, "INFO",
         f"{BOT_VERSION} · SYMBOL={SYMBOL} · TZ={TIMEZONE} · "
         f"TABS=({ws_trade.title},{ws_log.title}) · "
         f"TP1={fmt_dec(TP1_PCT,'0.0000001')} TP2={fmt_dec(TP2_PCT,'0.0000001')} SL={fmt_dec(SL_PCT,'0.0000001')} · "
-        f"MIN_OPEN_TRADES={MIN_OPEN_TRADES} POLL={POLL_SECONDS}s")
+        f"MIN_OPEN_TRADES={MIN_OPEN_TRADES} POLL={POLL_SECONDS}s · "
+        f"COOLDOWN={MIN_TRADE_GAP_SECONDS}s DIST_BP={MIN_ENTRY_DISTANCE_BP} GRID_BP={GRID_STEP_BP}")
 
     header = get_header(ws_trade)
     _H_CACHE = build_header_map(header)
@@ -574,7 +657,7 @@ def main_loop():
             update_open_rows_light(ws_trade, ws_log, client, _H_CACHE, _COL_PING_CACHE)
 
             ensure_min_open_trades(
-                ws_trade, ws_log,
+                ws_trade, ws_log, client,
                 H=_H_CACHE,
                 col_ping=_COL_PING_CACHE,
                 min_trades=MIN_OPEN_TRADES,
