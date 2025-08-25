@@ -1,4 +1,4 @@
-import os, json, time, unicodedata, requests
+import os, json, time, unicodedata, requests, re
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 
@@ -9,7 +9,7 @@ from binance.exceptions import BinanceAPIException, BinanceRequestException
 from twilio.rest import Client as TwilioClient
 
 # ========= COSTANTI =========
-BOT_VERSION = "oro-bot v1.4"
+BOT_VERSION = "oro-bot v1.5"
 
 # ========= ENV =========
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
@@ -54,10 +54,14 @@ HEARTBEAT_PRICE_DELTA_BP = int(os.getenv("HEARTBEAT_PRICE_DELTA_BP", "2"))
 # Riconciliazione meno frequente (per ridurre letture)
 RECONCILE_MIN_SECONDS = int(os.getenv("RECONCILE_MIN_SECONDS", "180"))
 
-# === Nuovi parametri anti-clustering ===
+# === Anti-clustering esistente ===
 MIN_TRADE_GAP_SECONDS = int(os.getenv("MIN_TRADE_GAP_SECONDS", "180"))  # cooldown temporale
 MIN_ENTRY_DISTANCE_BP = int(os.getenv("MIN_ENTRY_DISTANCE_BP", "12"))   # distanza minima da altri APERTI
 GRID_STEP_BP          = int(os.getenv("GRID_STEP_BP", "15"))            # passo minimo vs ultimo aperto (0=off)
+
+# === Nuove ENV anti rate-limit ===
+PRICE_MIN_INTERVAL = int(os.getenv("PRICE_MIN_INTERVAL", "3"))
+BANNED_FALLBACK_SLEEP = int(os.getenv("BANNED_FALLBACK_SLEEP", "30"))
 
 # Stato interno
 _LAST_HEADER_SIG = None
@@ -76,6 +80,11 @@ _COL_PING_CACHE = None
 # Stato per anti-clustering
 _LAST_TRADE_TS = 0
 _LAST_ENTRY_PRICE = None
+
+# ====== Guard & cache Binance ======
+_PRICE_CACHE = None
+_PRICE_CACHE_TS = 0.0
+_BINANCE_BANNED_UNTIL = 0.0   # epoch seconds
 
 
 # ========= UTILS =========
@@ -223,11 +232,47 @@ def binance_client():
     return BinanceClient(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
 
 def get_last_price(client) -> Decimal:
+    """
+    Lettura prezzo con:
+    - cache & throttle (PRICE_MIN_INTERVAL)
+    - ban guard su errori -1003 con pausa fino a _BINANCE_BANNED_UNTIL
+    """
+    global _PRICE_CACHE, _PRICE_CACHE_TS, _BINANCE_BANNED_UNTIL
+
+    now_ts = time.time()
+
+    # se in ban, non chiamare l'API
+    if now_ts < _BINANCE_BANNED_UNTIL:
+        return d(_PRICE_CACHE) if _PRICE_CACHE is not None else Decimal("0")
+
+    # throttle
+    if _PRICE_CACHE is not None and (now_ts - _PRICE_CACHE_TS) < PRICE_MIN_INTERVAL:
+        return d(_PRICE_CACHE)
+
     try:
-        p=client.get_symbol_ticker(symbol=SYMBOL)
-        return d(p["price"])
-    except (BinanceAPIException, BinanceRequestException, KeyError, TypeError) as e:
-        print(f"[BINANCE] {e}"); return Decimal("0")
+        p = client.get_symbol_ticker(symbol=SYMBOL)
+        price = d(p["price"])
+        if price != 0:
+            _PRICE_CACHE = price
+            _PRICE_CACHE_TS = now_ts
+        return price
+    except BinanceAPIException as e:
+        msg = str(e)
+        m = re.search(r"banned until (\d+)", msg)
+        if m:
+            try:
+                ban_ms = int(m.group(1))
+                _BINANCE_BANNED_UNTIL = max(_BINANCE_BANNED_UNTIL, ban_ms / 1000.0)
+            except Exception:
+                _BINANCE_BANNED_UNTIL = now_ts + 300
+        elif "-1003" in msg or "Too much request weight" in msg:
+            _BINANCE_BANNED_UNTIL = now_ts + 60
+
+        print(f"[BINANCE] {msg}")
+        return d(_PRICE_CACHE) if _PRICE_CACHE is not None else Decimal("0")
+    except (BinanceRequestException, KeyError, TypeError) as e:
+        print(f"[BINANCE] {e}")
+        return d(_PRICE_CACHE) if _PRICE_CACHE is not None else Decimal("0")
 
 
 # ========= LOGICA =========
@@ -360,9 +405,10 @@ def should_log_heartbeat(price: Decimal) -> bool:
         pass
     return False
 
-def update_open_rows_light(ws_trade, ws_log, client, H, col_ping):
+def update_open_rows_light(ws_trade, ws_log, client, H, col_ping, lastp=None):
     nowloc = now_local_str()
-    lastp = get_last_price(client)
+    if lastp is None:
+        lastp = get_last_price(client)
     if lastp == 0:
         log(ws_log, "WARN", "Prezzo 0 da Binance")
         return
@@ -379,7 +425,7 @@ def update_open_rows_light(ws_trade, ws_log, client, H, col_ping):
     start_row = 2
     end_row = start_row + n_rows - 1
 
-    # Ping sintetico (utile a diagnosi frequenza ciclo)
+    # Ping sintetico
     log(ws_log, "DEBUG", f"Ping @ {fmt_dec(lastp)} · righe={n_rows} · stato_col_len={len(stato_col)}")
 
     updates = []
@@ -537,12 +583,14 @@ def open_new_trade(ws_trade, ws_log, trade_id: str, side="LONG", qty=Decimal("1"
 
 
 def ensure_min_open_trades(ws_trade, ws_log, client, H, col_ping,
-                           min_trades=5, side="LONG", qty=Decimal("1")):
+                           min_trades=5, side="LONG", qty=Decimal("1"),
+                           last_price: Decimal | None = None):
     """
-    Mantiene almeno min_trades APERTI, ma applica:
+    Mantiene almeno min_trades APERTI, applicando:
     - Cooldown temporale MIN_TRADE_GAP_SECONDS
     - Distanza minima dai trade APERTI in bps (MIN_ENTRY_DISTANCE_BP)
     - Grid step rispetto all'ultimo aperto (GRID_STEP_BP)
+    Usa 'last_price' se fornito dal loop; altrimenti legge da Binance.
     """
     global _LAST_TRADE_TS, _LAST_ENTRY_PRICE
     try:
@@ -555,13 +603,12 @@ def ensure_min_open_trades(ws_trade, ws_log, client, H, col_ping,
         if to_open <= 0:
             return
 
-        # --- filtri anti-clustering ---
         now_ts = time.time()
         if now_ts - _LAST_TRADE_TS < MIN_TRADE_GAP_SECONDS:
             log(ws_log, "DEBUG", f"Skip open: cooldown attivo {int(now_ts - _LAST_TRADE_TS)}s < {MIN_TRADE_GAP_SECONDS}s")
             return
 
-        lastp = get_last_price(client)
+        lastp = d(last_price) if last_price else get_last_price(client)
         if lastp == 0:
             log(ws_log, "WARN", "Prezzo 0 da Binance (skip open)")
             return
@@ -593,7 +640,7 @@ def ensure_min_open_trades(ws_trade, ws_log, client, H, col_ping,
                     f"Skip open: grid step {move_bp:.1f}bp < {GRID_STEP_BP}bp (ultimo={fmt_dec(_LAST_ENTRY_PRICE)} last={fmt_dec(lastp)})")
                 return
 
-        # --- apri i mancanti (in pratica ne passerà 1 per giro grazie ai filtri) ---
+        # Apri i mancanti (di fatto passerà 1/giro grazie ai filtri)
         for i in range(to_open):
             trade_id = f"{SYMBOL}-{int(time.time())}-AUTO{i}"
             try:
@@ -608,17 +655,15 @@ def ensure_min_open_trades(ws_trade, ws_log, client, H, col_ping,
                 _LAST_ENTRY_PRICE = used_price
                 log(ws_log, "INFO",
                     f"Aperto trade automatico {trade_id} (min={min_trades}) · price={fmt_dec(used_price)}")
-                # dopo il primo, gli altri verranno bloccati da cooldown/grid → break
                 break
             except Exception as e:
                 log(ws_log, "ERROR", f"Apertura trade automatico fallita ({trade_id}): {e}")
-                # continua a provare quello dopo (se i filtri lo consentono)
     except Exception as e:
         log(ws_log, "ERROR", f"ensure_min_open_trades error: {e}")
 
 
 def main_loop():
-    global _H_CACHE, _COL_PING_CACHE, _LAST_RECONCILE_TS
+    global _H_CACHE, _COL_PING_CACHE, _LAST_RECONCILE_TS, _BINANCE_BANNED_UNTIL
 
     ws_trade, ws_log = open_sheets()
     client = binance_client()
@@ -650,11 +695,21 @@ def main_loop():
 
     while True:
         try:
+            # Se in ban, pausa gentile e riprova
+            if time.time() < _BINANCE_BANNED_UNTIL:
+                ts = datetime.fromtimestamp(_BINANCE_BANNED_UNTIL).strftime('%Y-%m-%d %H:%M:%S')
+                log(ws_log, "WARN", f"Binance bannato fino a {ts}. Sleep {BANNED_FALLBACK_SLEEP}s")
+                time.sleep(BANNED_FALLBACK_SLEEP)
+                continue
+
+            # Una sola lettura prezzo per ciclo (throttlata e con cache)
+            lastp = get_last_price(client)
+
             if time.time() - _LAST_RECONCILE_TS >= RECONCILE_MIN_SECONDS:
                 reconcile_and_notify_starts(ws_trade, ws_log, SYMBOL)
                 _LAST_RECONCILE_TS = time.time()
 
-            update_open_rows_light(ws_trade, ws_log, client, _H_CACHE, _COL_PING_CACHE)
+            update_open_rows_light(ws_trade, ws_log, client, _H_CACHE, _COL_PING_CACHE, lastp=lastp)
 
             ensure_min_open_trades(
                 ws_trade, ws_log, client,
@@ -662,10 +717,10 @@ def main_loop():
                 col_ping=_COL_PING_CACHE,
                 min_trades=MIN_OPEN_TRADES,
                 side=AUTO_TRADE_SIDE.upper(),
-                qty=DEFAULT_QTY
+                qty=DEFAULT_QTY,
+                last_price=lastp
             )
 
-            lastp = get_last_price(client)
             if lastp != 0 and should_log_heartbeat(lastp):
                 log(ws_log, "INFO", f"Heartbeat OK - {fmt_dec(lastp)}")
 
