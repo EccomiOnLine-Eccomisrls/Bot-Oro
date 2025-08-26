@@ -89,25 +89,60 @@ _BINANCE_BANNED_UNTIL = 0.0   # epoch seconds
 
 # ========= UTILS =========
 def d(x) -> Decimal:
-    if isinstance(x, Decimal): return x
-    if x is None: return Decimal("0")
+    """
+    Converte varie forme in Decimal.
+    Gestisce anche casi sporchi: '3.370,00', '3370.00.00', ' 3 370 . 00 '.
+    - Ritorna Decimal('0') se non interpretabile.
+    - Supporta percentuali (es. '0,02%').
+    """
+    if isinstance(x, Decimal):
+        return x
+    if x is None:
+        return Decimal("0")
+
     s = str(x).strip()
-    if not s: return Decimal("0")
-    is_percent = False
-    if s.endswith("%"):
-        is_percent = True
+    if not s:
+        return Decimal("0")
+
+    # percentuali
+    is_percent = s.endswith("%")
+    if is_percent:
         s = s[:-1].strip()
+
+    # togli spazi
     s = s.replace(" ", "")
-    if "." in s and "," in s:
-        s = s.replace(".", "").replace(",", ".")
-    elif "," in s:
-        s = s.replace(",", ".")
+
+    # se ci sono virgole, trattale come decimali (it-IT) e converti a punto
+    s = s.replace(",", ".")
+
+    # se ci sono PIÙ punti decimali (es. '3370.00.00'), tieni solo i primi due blocchi
+    if s.count(".") > 1:
+        parts = s.split(".")
+        # es: ['3370','00','00'] -> '3370.00'
+        s = parts[0] + "." + parts[1]
+
+    # se rimangono caratteri non numerici (tipo '3.370.00abc'), ripulisci conservando
+    # solo cifre e al più un punto decimale
+    # (mantieni il primo punto, elimina gli altri)
+    cleaned = []
+    dot_used = False
+    for ch in s:
+        if ch.isdigit():
+            cleaned.append(ch)
+        elif ch == "." and not dot_used:
+            cleaned.append(ch)
+            dot_used = True
+        # altri caratteri vengono ignorati
+    s = "".join(cleaned) if cleaned else "0"
+
     try:
         val = Decimal(s)
-    except:
+    except Exception:
         return Decimal("0")
-    if is_percent: val = val / Decimal("100")
-    return val
+
+    if is_percent:
+        val = val / Decimal("100")
+    return valval
 
 def fmt_dec(x: Decimal, q="0.00001") -> str:
     return d(x).quantize(Decimal(q), rounding=ROUND_HALF_UP).normalize().to_eng_string()
