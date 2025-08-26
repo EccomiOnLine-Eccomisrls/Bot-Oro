@@ -118,12 +118,9 @@ def d(x) -> Decimal:
     # se ci sono PIÙ punti decimali (es. '3370.00.00'), tieni solo i primi due blocchi
     if s.count(".") > 1:
         parts = s.split(".")
-        # es: ['3370','00','00'] -> '3370.00'
         s = parts[0] + "." + parts[1]
 
-    # se rimangono caratteri non numerici (tipo '3.370.00abc'), ripulisci conservando
-    # solo cifre e al più un punto decimale
-    # (mantieni il primo punto, elimina gli altri)
+    # pulizia finale: solo cifre e al massimo un punto
     cleaned = []
     dot_used = False
     for ch in s:
@@ -132,7 +129,6 @@ def d(x) -> Decimal:
         elif ch == "." and not dot_used:
             cleaned.append(ch)
             dot_used = True
-        # altri caratteri vengono ignorati
     s = "".join(cleaned) if cleaned else "0"
 
     try:
@@ -142,7 +138,7 @@ def d(x) -> Decimal:
 
     if is_percent:
         val = val / Decimal("100")
-    return valval
+    return val
 
 def fmt_dec(x: Decimal, q="0.00001") -> str:
     return d(x).quantize(Decimal(q), rounding=ROUND_HALF_UP).normalize().to_eng_string()
