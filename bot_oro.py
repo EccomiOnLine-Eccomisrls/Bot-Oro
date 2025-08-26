@@ -59,7 +59,7 @@ MIN_TRADE_GAP_SECONDS = int(os.getenv("MIN_TRADE_GAP_SECONDS", "180"))  # cooldo
 MIN_ENTRY_DISTANCE_BP = int(os.getenv("MIN_ENTRY_DISTANCE_BP", "12"))   # distanza minima da altri APERTI
 GRID_STEP_BP          = int(os.getenv("GRID_STEP_BP", "15"))            # passo minimo vs ultimo aperto (0=off)
 
-# === Nuove ENV anti rate-limit ===
+# === Anti rate-limit ===
 PRICE_MIN_INTERVAL = int(os.getenv("PRICE_MIN_INTERVAL", "3"))
 BANNED_FALLBACK_SLEEP = int(os.getenv("BANNED_FALLBACK_SLEEP", "30"))
 
@@ -173,7 +173,7 @@ ALIAS = {
     "lato": ["side","direzione"],
     "stato": ["status","state"],
     "prezzo ingresso": ["ingresso","entry","entry price","prezzo entry","prezzo d'ingresso","prezzo di ingresso"],
-    "qty": ["quantita","quantity","size","q.tà","quantità"],
+    "qty": ["quantita","quantity","size","q.tà","quantità","q.tÃ ","quantitÃ "],
     "sl %": ["sl","stop loss","stoploss","sl pct","sl percentuale"],
     "tp1 %": ["tp1","take profit 1","tp1 pct","tp1 percentuale"],
     "tp2 %": ["tp2","take profit 2","tp2 pct","tp2 percentuale"],
@@ -182,7 +182,7 @@ ALIAS = {
     "delta": ["differenza", "delta prezzo", "diff", "delta $", "delta value"],
     "p&l %": ["pl %","pnl %","profit %","p e l %"],
     "p&l valore": ["pl","p l","pnl","profit","pl valore","pnl valore","p e l valore","p & l valore"],
-    "equity post-trade": ["equity","saldo","balance","equity post trade","equity post trade","equity post − trade","equity post – trade","equity post — trade"],
+    "equity post-trade": ["equity","saldo","balance","equity post trade","equity post trade","equity post − trade","equity post – trade","equity post — trade","equity post â trade","equity post â trade","equity post â trade"],
     "strategia": ["strategy","strat"],
     "note": ["notes","esito","tp/sl","esecuzione","nota"],
 }
@@ -240,12 +240,9 @@ def get_last_price(client) -> Decimal:
     global _PRICE_CACHE, _PRICE_CACHE_TS, _BINANCE_BANNED_UNTIL
 
     now_ts = time.time()
-
-    # se in ban, non chiamare l'API
     if now_ts < _BINANCE_BANNED_UNTIL:
         return d(_PRICE_CACHE) if _PRICE_CACHE is not None else Decimal("0")
 
-    # throttle
     if _PRICE_CACHE is not None and (now_ts - _PRICE_CACHE_TS) < PRICE_MIN_INTERVAL:
         return d(_PRICE_CACHE)
 
@@ -336,18 +333,22 @@ def reconcile_and_notify_starts(ws_trade, ws_log, symbol: str):
         close_str = (row[L_CLOSE - 1] if L_CLOSE and len(row) >= L_CLOSE else "").strip()
         has_close = bool(close_str)
 
+        # Se è già presente un prezzo di chiusura ma non è segnato chiuso -> chiudi
         if has_close and stato in ("", "APERTO"):
             updates.append({"range": gspread.utils.rowcol_to_a1(r, L_STATO), "values": [["CHIUSO"]]})
             stato = "CHIUSO"
 
+        # Se la cella entry NON è vuota e lo stato è vuoto -> APERTO
         if entry_str and stato == "":
             updates.append({"range": gspread.utils.rowcol_to_a1(r, L_STATO), "values": [["APERTO"]]})
             stato = "APERTO"
 
+        # Genera ID se manca su riga APERTA
         if stato == "APERTO" and not trade_id:
             trade_id = gen_trade_id(symbol, r)
             updates.append({"range": gspread.utils.rowcol_to_a1(r, L_ID), "values": [[trade_id]]})
 
+        # START una sola volta
         if stato == "APERTO" and entry > 0 and not start_already_notified(log_msgs, trade_id):
             TP1 = d(row[L_TP1 - 1]) if L_TP1 and len(row) >= L_TP1 and (row[L_TP1 - 1] or "").strip() else TP1_PCT
             TP2 = d(row[L_TP2 - 1]) if L_TP2 and len(row) >= L_TP2 and (row[L_TP2 - 1] or "").strip() else TP2_PCT
@@ -369,79 +370,88 @@ def reconcile_and_notify_starts(ws_trade, ws_log, symbol: str):
             "data": updates
         })
 
-
-# ========= CHIUSURA IMMEDIATA SE 'PREZZO CHIUSURA' ESISTE =========
-def close_rows_marked(ws_trade, ws_log, H):
+# ========== NUOVO: gestione chiusure manuali ==========
+def process_manual_closes(ws_trade, ws_log, H):
     """
-    Chiude immediatamente tutte le righe con Stato=APERTO e 'Prezzo chiusura' valorizzato,
-    calcolando P&L ed Equity post-trade. Non usa Binance.
+    Se 'Prezzo chiusura' è valorizzato ma P&L/equity non sono ancora scritti
+    (oppure Stato non è CHIUSO), calcola P&L e chiude la riga.
     """
-    try:
-        stato_col = ws_trade.col_values(H["stato"])
-        close_col = ws_trade.col_values(H["prezzo chiusura"]) if "prezzo chiusura" in H else []
-        if len(stato_col) <= 1:
-            return
+    if "prezzo chiusura" not in H:
+        return
 
-        side_col  = ws_trade.col_values(H["lato"]) if "lato" in H else []
-        entry_col = ws_trade.col_values(H["prezzo ingresso"])
-        qty_col   = ws_trade.col_values(H["qty"]) if "qty" in H else []
+    stato_col_idx  = H["stato"]
+    lato_idx       = H["lato"] if "lato" in H else None
+    entry_idx      = H["prezzo ingresso"]
+    close_idx      = H["prezzo chiusura"]
+    qty_idx        = H["qty"] if "qty" in H else None
+    plpct_idx      = H["p&l %"]
+    plval_idx      = H["p&l valore"]
+    equity_idx     = H["equity post-trade"]
+    note_idx       = H.get("note")
 
-        plpct_col_idx  = H["p&l %"]
-        plval_col_idx  = H["p&l valore"]
-        equity_col_idx = H["equity post-trade"]
-        note_col_idx   = H.get("note")
-        stato_col_idx  = H["stato"]
+    rows = ws_trade.get_all_values()
+    if len(rows) <= 1:
+        return
 
-        updates = []
-        closed_count = 0
+    updates = []
+    for r in range(2, len(rows)+1):
+        row = rows[r-1]
 
-        for i in range(1, len(stato_col)):
-            stato = (stato_col[i] or "").strip().upper()
-            close_str = (close_col[i] if i < len(close_col) else "").strip()
-            if stato != "APERTO" or not close_str:
-                continue
+        # valori raw
+        stato = (row[stato_col_idx-1] if len(row) >= stato_col_idx else "").strip().upper()
+        entry_str = (row[entry_idx-1] if len(row) >= entry_idx else "").strip()
+        close_str = (row[close_idx-1] if len(row) >= close_idx else "").strip()
+        plpct_str = (row[plpct_idx-1] if len(row) >= plpct_idx else "").strip()
+        plval_str = (row[plval_idx-1] if len(row) >= plval_idx else "").strip()
 
-            r = i + 1  # riga foglio (1-based)
-            side  = (side_col[i] if i < len(side_col) else "LONG").strip().upper()
-            entry = d(entry_col[i]) if i < len(entry_col) and entry_col[i] else Decimal("0")
-            qty   = d(qty_col[i])   if i < len(qty_col)   and qty_col[i]   else Decimal("1")
-            close = d(close_str)
+        if not close_str:
+            continue  # niente da fare
 
-            if entry == 0 or close == 0:
-                continue
+        entry = d(entry_str) if entry_str else Decimal("0")
+        close = d(close_str)
+        side  = (row[lato_idx-1] if lato_idx and len(row) >= lato_idx else "LONG").strip().upper()
+        qty   = d(row[qty_idx-1]) if qty_idx and len(row) >= qty_idx and (row[qty_idx-1] or "").strip() else Decimal("1")
 
-            pnl_pct, pnl_val = pnl_values(side, entry, close, qty)
-            eq_prev = last_equity(ws_trade, equity_col_idx)
-            eq_new  = eq_prev + pnl_val
+        if entry == 0 or close == 0:
+            continue
 
-            updates += [
-                {"range": gspread.utils.rowcol_to_a1(r, stato_col_idx), "values": [["CHIUSO"]]},
-                {"range": gspread.utils.rowcol_to_a1(r, plpct_col_idx), "values": [[fmt_dec(pnl_pct, "0.0001")]]},
-                {"range": gspread.utils.rowcol_to_a1(r, plval_col_idx), "values": [[fmt_dec(pnl_val, "0.01")]]},
-                {"range": gspread.utils.rowcol_to_a1(r, equity_col_idx), "values": [[fmt_dec(eq_new, "0.01")]]},
-            ]
-            if note_col_idx:
-                updates.append({"range": gspread.utils.rowcol_to_a1(r, note_col_idx), "values": [["RESET"]]})
+        # se è già CHIUSO ma P&L non scritti, oppure non CHIUSO affatto, calcola
+        need_calc = (not plpct_str) or (not plval_str) or (stato != "CHIUSO")
+        if not need_calc:
+            continue
 
-            log(ws_log, "INFO",
-                f"Close MANUAL r{r} - side={side} entry={fmt_dec(entry)} close={fmt_dec(close)} "
-                f"pnl%={fmt_dec(pnl_pct,'0.0001')} pnl=${fmt_dec(pnl_val,'0.01')} eq->{fmt_dec(eq_new,'0.01')}")
-            notify(
-                f"BOT ORO | {SYMBOL}\n"
-                f"Chiusura manuale\n"
-                f"Entry: {fmt_dec(entry)}  Close: {fmt_dec(close)}\n"
-                f"P&L: {fmt_dec(pnl_val,'0.01')} USD  ({fmt_dec(pnl_pct,'0.0001')}%)\n"
-                f"Equity: {fmt_dec(eq_new,'0.01')} - {TIMEZONE}"
-            )
-            closed_count += 1
+        pnl_pct, pnl_val = pnl_values(side, entry, close, qty)
+        eq_prev = last_equity(ws_trade, equity_idx)
+        eq_new  = eq_prev + pnl_val
 
-        if updates:
-            ws_trade.spreadsheet.values_batch_update(
-                {"valueInputOption": "USER_ENTERED", "data": updates}
-            )
-            log(ws_log, "INFO", f"Chiusure manuali processate: {closed_count}")
-    except Exception as e:
-        log(ws_log, "ERROR", f"close_rows_marked error: {e}")
+        # prepara aggiornamenti
+        if stato != "CHIUSO":
+            updates.append({"range": gspread.utils.rowcol_to_a1(r, stato_col_idx), "values": [["CHIUSO"]]})
+        updates += [
+            {"range": gspread.utils.rowcol_to_a1(r, plpct_idx),  "values": [[fmt_dec(pnl_pct, "0.0001")]]},
+            {"range": gspread.utils.rowcol_to_a1(r, plval_idx),  "values": [[fmt_dec(pnl_val, "0.01")]]},
+            {"range": gspread.utils.rowcol_to_a1(r, equity_idx), "values": [[fmt_dec(eq_new, "0.01")]]},
+        ]
+        if note_idx:
+            cur_note = (row[note_idx-1] if len(row) >= note_idx else "").strip()
+            if not cur_note:
+                updates.append({"range": gspread.utils.rowcol_to_a1(r, note_idx), "values": [["MANUAL"]]})
+
+        log(ws_log, "INFO",
+            f"Chiusura MANUAL r{r} - side={side} entry={fmt_dec(entry)} close={fmt_dec(close)} "
+            f"pnl%={fmt_dec(pnl_pct,'0.0001')} pnl=${fmt_dec(pnl_val,'0.01')} "
+            f"equity->{fmt_dec(eq_new,'0.01')}")
+
+        notify(
+            f"BOT ORO | {SYMBOL}\n"
+            f"Chiusura manuale\n"
+            f"Entry: {fmt_dec(entry)}  Close: {fmt_dec(close)}\n"
+            f"P&L: {fmt_dec(pnl_val,'0.01')} USD  ({fmt_dec(pnl_pct,'0.0001')}%)\n"
+            f"Equity: {fmt_dec(eq_new,'0.01')} - {TIMEZONE}"
+        )
+
+    if updates:
+        ws_trade.spreadsheet.values_batch_update({"valueInputOption": "USER_ENTERED", "data": updates})
 
 
 # ========= OPERATIVA PRINCIPALE =========
@@ -499,7 +509,6 @@ def update_open_rows_light(ws_trade, ws_log, client, H, col_ping, lastp=None):
     start_row = 2
     end_row = start_row + n_rows - 1
 
-    # Ping sintetico
     log(ws_log, "DEBUG", f"Ping @ {fmt_dec(lastp)} - righe={n_rows} - stato_col_len={len(stato_col)}")
 
     updates = []
@@ -573,7 +582,7 @@ def update_open_rows_light(ws_trade, ws_log, client, H, col_ping, lastp=None):
                     f"tp1={fmt_dec(tp1)} tp2={fmt_dec(tp2)} sl={fmt_dec(sl)} qty={fmt_dec(qty,'0.00000001')}")
             continue
 
-        # Chiusura automatica su TP/SL
+        # Chiusura per TP/SL
         pnl_pct, pnl_val = pnl_values(side, entry, close_price, qty)
         eq_prev = last_equity(ws_trade, equity_col_idx)
         eq_new  = eq_prev + pnl_val
@@ -593,8 +602,9 @@ def update_open_rows_light(ws_trade, ws_log, client, H, col_ping, lastp=None):
         ]
 
         log(ws_log, "INFO",
-            f"Close {hit} r{r} - side={side} entry={fmt_dec(entry)} close={fmt_dec(close_price)} "
-            f"pnl%={fmt_dec(pnl_pct,'0.0001')} pnl=${fmt_dec(pnl_val,'0.01')} eq->{fmt_dec(eq_new,'0.01')}")
+            f"Close {hit} r{r} - side={side} entry={fmt_dec(entry)} "
+            f"close={fmt_dec(close_price)} pnl%={fmt_dec(pnl_pct,'0.0001')} "
+            f"pnl=${fmt_dec(pnl_val,'0.01')} eq->{fmt_dec(eq_new,'0.01')}")
 
         notify(
             f"BOT ORO | {SYMBOL}\n"
@@ -610,10 +620,6 @@ def update_open_rows_light(ws_trade, ws_log, client, H, col_ping, lastp=None):
 
 def open_new_trade(ws_trade, ws_log, trade_id: str, side="LONG", qty=Decimal("1"),
                    H=None, col_ping=None, entry_price: Decimal | None = None) -> Decimal:
-    """
-    Apre una riga trade e ritorna il prezzo di ingresso usato.
-    Se entry_price è passato, usa quello; altrimenti preleva da Binance.
-    """
     if H is None:
         header = get_header(ws_trade); H = build_header_map(header)
     need=["data/ora","id trade","lato","stato","prezzo ingresso","qty","sl %","tp1 %","tp2 %","ultimo ping"]
@@ -658,16 +664,9 @@ def open_new_trade(ws_trade, ws_log, trade_id: str, side="LONG", qty=Decimal("1"
 def ensure_min_open_trades(ws_trade, ws_log, client, H, col_ping,
                            min_trades=5, side="LONG", qty=Decimal("1"),
                            last_price: Decimal | None = None):
-    """
-    Mantiene almeno min_trades APERTI, applicando:
-    - Cooldown temporale MIN_TRADE_GAP_SECONDS
-    - Distanza minima dai trade APERTI in bps (MIN_ENTRY_DISTANCE_BP)
-    - Grid step rispetto all'ultimo aperto (GRID_STEP_BP)
-    Usa 'last_price' se fornito dal loop; altrimenti legge da Binance.
-    """
     global _LAST_TRADE_TS, _LAST_ENTRY_PRICE
     try:
-        stato_col = ws_trade.col_values(H["stato"])  # include header
+        stato_col = ws_trade.col_values(H["stato"])
         n_open = 0
         if len(stato_col) > 1:
             n_open = sum(1 for s in stato_col[1:] if (s or "").strip().upper() == "APERTO")
@@ -756,6 +755,7 @@ def main_loop():
     dump_headers_once(ws_trade, ws_log)
 
     reconcile_and_notify_starts(ws_trade, ws_log, SYMBOL)
+    process_manual_closes(ws_trade, ws_log, _H_CACHE)   # <<-- nuovo: gestisci chiusure manuali subito
     _LAST_RECONCILE_TS = time.time()
 
     if AUTO_OPEN_ON_START:
@@ -775,21 +775,17 @@ def main_loop():
                 time.sleep(BANNED_FALLBACK_SLEEP)
                 continue
 
-            # 1) Chiudi SUBITO le righe con 'Prezzo chiusura' compilato (no Binance)
-            close_rows_marked(ws_trade, ws_log, _H_CACHE)
-
-            # 2) Una sola lettura prezzo per ciclo (throttlata e con cache)
+            # Una sola lettura prezzo per ciclo (throttlata e con cache)
             lastp = get_last_price(client)
 
-            # 3) Riconciliazione saltuaria
+            # Riconcilio periodico + chiusure manuali
             if time.time() - _LAST_RECONCILE_TS >= RECONCILE_MIN_SECONDS:
                 reconcile_and_notify_starts(ws_trade, ws_log, SYMBOL)
+                process_manual_closes(ws_trade, ws_log, _H_CACHE)   # <<-- nuovo: anche periodico
                 _LAST_RECONCILE_TS = time.time()
 
-            # 4) Aggiorna P&L / ping
             update_open_rows_light(ws_trade, ws_log, client, _H_CACHE, _COL_PING_CACHE, lastp=lastp)
 
-            # 5) Mantieni minimo aperti (con anti-clustering)
             ensure_min_open_trades(
                 ws_trade, ws_log, client,
                 H=_H_CACHE,
@@ -800,7 +796,6 @@ def main_loop():
                 last_price=lastp
             )
 
-            # 6) Heartbeat
             if lastp != 0 and should_log_heartbeat(lastp):
                 log(ws_log, "INFO", f"Heartbeat OK - {fmt_dec(lastp)}")
 
