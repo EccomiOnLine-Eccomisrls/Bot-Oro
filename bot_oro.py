@@ -9,7 +9,7 @@ from binance.exceptions import BinanceAPIException, BinanceRequestException
 from twilio.rest import Client as TwilioClient
 
 # ========= COSTANTI =========
-BOT_VERSION = "oro-bot v1.5"
+BOT_VERSION = "oro-bot v1.6"
 
 # ========= ENV =========
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
@@ -354,10 +354,10 @@ def reconcile_and_notify_starts(ws_trade, ws_log, symbol: str):
             SL  = d(row[L_SL  - 1]) if L_SL  and len(row) >= L_SL  and (row[L_SL  - 1]  or "").strip() else SL_PCT
 
             msg = (
-                f"🚀 BOT ORO | {symbol}\n"
+                f"BOT ORO | {symbol}\n"
                 f"Aperto trade {trade_id}\n"
-                f"Side: {side} · Entry: {fmt_dec(entry)}\n"
-                f"TP1 {fmt_dec(entry*(1+TP1))} · TP2 {fmt_dec(entry*(1+TP2))} · SL {fmt_dec(entry*(1-SL))}\n"
+                f"Side: {side} - Entry: {fmt_dec(entry)}\n"
+                f"TP1 {fmt_dec(entry*(1+TP1))} - TP2 {fmt_dec(entry*(1+TP2))} - SL {fmt_dec(entry*(1-SL))}\n"
                 f"{TIMEZONE}"
             )
             notify(msg)
@@ -368,6 +368,80 @@ def reconcile_and_notify_starts(ws_trade, ws_log, symbol: str):
             "valueInputOption": "USER_ENTERED",
             "data": updates
         })
+
+
+# ========= CHIUSURA IMMEDIATA SE 'PREZZO CHIUSURA' ESISTE =========
+def close_rows_marked(ws_trade, ws_log, H):
+    """
+    Chiude immediatamente tutte le righe con Stato=APERTO e 'Prezzo chiusura' valorizzato,
+    calcolando P&L ed Equity post-trade. Non usa Binance.
+    """
+    try:
+        stato_col = ws_trade.col_values(H["stato"])
+        close_col = ws_trade.col_values(H["prezzo chiusura"]) if "prezzo chiusura" in H else []
+        if len(stato_col) <= 1:
+            return
+
+        side_col  = ws_trade.col_values(H["lato"]) if "lato" in H else []
+        entry_col = ws_trade.col_values(H["prezzo ingresso"])
+        qty_col   = ws_trade.col_values(H["qty"]) if "qty" in H else []
+
+        plpct_col_idx  = H["p&l %"]
+        plval_col_idx  = H["p&l valore"]
+        equity_col_idx = H["equity post-trade"]
+        note_col_idx   = H.get("note")
+        stato_col_idx  = H["stato"]
+
+        updates = []
+        closed_count = 0
+
+        for i in range(1, len(stato_col)):
+            stato = (stato_col[i] or "").strip().upper()
+            close_str = (close_col[i] if i < len(close_col) else "").strip()
+            if stato != "APERTO" or not close_str:
+                continue
+
+            r = i + 1  # riga foglio (1-based)
+            side  = (side_col[i] if i < len(side_col) else "LONG").strip().upper()
+            entry = d(entry_col[i]) if i < len(entry_col) and entry_col[i] else Decimal("0")
+            qty   = d(qty_col[i])   if i < len(qty_col)   and qty_col[i]   else Decimal("1")
+            close = d(close_str)
+
+            if entry == 0 or close == 0:
+                continue
+
+            pnl_pct, pnl_val = pnl_values(side, entry, close, qty)
+            eq_prev = last_equity(ws_trade, equity_col_idx)
+            eq_new  = eq_prev + pnl_val
+
+            updates += [
+                {"range": gspread.utils.rowcol_to_a1(r, stato_col_idx), "values": [["CHIUSO"]]},
+                {"range": gspread.utils.rowcol_to_a1(r, plpct_col_idx), "values": [[fmt_dec(pnl_pct, "0.0001")]]},
+                {"range": gspread.utils.rowcol_to_a1(r, plval_col_idx), "values": [[fmt_dec(pnl_val, "0.01")]]},
+                {"range": gspread.utils.rowcol_to_a1(r, equity_col_idx), "values": [[fmt_dec(eq_new, "0.01")]]},
+            ]
+            if note_col_idx:
+                updates.append({"range": gspread.utils.rowcol_to_a1(r, note_col_idx), "values": [["RESET"]]})
+
+            log(ws_log, "INFO",
+                f"Close MANUAL r{r} - side={side} entry={fmt_dec(entry)} close={fmt_dec(close)} "
+                f"pnl%={fmt_dec(pnl_pct,'0.0001')} pnl=${fmt_dec(pnl_val,'0.01')} eq->{fmt_dec(eq_new,'0.01')}")
+            notify(
+                f"BOT ORO | {SYMBOL}\n"
+                f"Chiusura manuale\n"
+                f"Entry: {fmt_dec(entry)}  Close: {fmt_dec(close)}\n"
+                f"P&L: {fmt_dec(pnl_val,'0.01')} USD  ({fmt_dec(pnl_pct,'0.0001')}%)\n"
+                f"Equity: {fmt_dec(eq_new,'0.01')} - {TIMEZONE}"
+            )
+            closed_count += 1
+
+        if updates:
+            ws_trade.spreadsheet.values_batch_update(
+                {"valueInputOption": "USER_ENTERED", "data": updates}
+            )
+            log(ws_log, "INFO", f"Chiusure manuali processate: {closed_count}")
+    except Exception as e:
+        log(ws_log, "ERROR", f"close_rows_marked error: {e}")
 
 
 # ========= OPERATIVA PRINCIPALE =========
@@ -426,7 +500,7 @@ def update_open_rows_light(ws_trade, ws_log, client, H, col_ping, lastp=None):
     end_row = start_row + n_rows - 1
 
     # Ping sintetico
-    log(ws_log, "DEBUG", f"Ping @ {fmt_dec(lastp)} · righe={n_rows} · stato_col_len={len(stato_col)}")
+    log(ws_log, "DEBUG", f"Ping @ {fmt_dec(lastp)} - righe={n_rows} - stato_col_len={len(stato_col)}")
 
     updates = []
     for r in range(start_row, end_row + 1):
@@ -499,7 +573,7 @@ def update_open_rows_light(ws_trade, ws_log, client, H, col_ping, lastp=None):
                     f"tp1={fmt_dec(tp1)} tp2={fmt_dec(tp2)} sl={fmt_dec(sl)} qty={fmt_dec(qty,'0.00000001')}")
             continue
 
-        # Chiusura
+        # Chiusura automatica su TP/SL
         pnl_pct, pnl_val = pnl_values(side, entry, close_price, qty)
         eq_prev = last_equity(ws_trade, equity_col_idx)
         eq_new  = eq_prev + pnl_val
@@ -519,16 +593,15 @@ def update_open_rows_light(ws_trade, ws_log, client, H, col_ping, lastp=None):
         ]
 
         log(ws_log, "INFO",
-            f"Close {hit} r{r} · side={side} entry={fmt_dec(entry)} "
-            f"close={fmt_dec(close_price)} pnl%={fmt_dec(pnl_pct,'0.0001')} "
-            f"pnl=${fmt_dec(pnl_val,'0.01')} eq->{fmt_dec(eq_new,'0.01')}")
+            f"Close {hit} r{r} - side={side} entry={fmt_dec(entry)} close={fmt_dec(close_price)} "
+            f"pnl%={fmt_dec(pnl_pct,'0.0001')} pnl=${fmt_dec(pnl_val,'0.01')} eq->{fmt_dec(eq_new,'0.01')}")
 
         notify(
-            f"⛏️ BOT ORO | {SYMBOL}\n"
+            f"BOT ORO | {SYMBOL}\n"
             f"Trade chiuso: {hit}\n"
             f"Entry: {fmt_dec(entry)}  Close: {fmt_dec(close_price)}\n"
             f"P&L: {fmt_dec(pnl_val,'0.01')} USD  ({fmt_dec(pnl_pct,'0.0001')}%)\n"
-            f"Equity: {fmt_dec(eq_new,'0.01')} · {TIMEZONE}"
+            f"Equity: {fmt_dec(eq_new,'0.01')} - {TIMEZONE}"
         )
 
     if updates:
@@ -572,10 +645,10 @@ def open_new_trade(ws_trade, ws_log, trade_id: str, side="LONG", qty=Decimal("1"
     row[col_ping-1] = f"{now_local_str()} - {fmt_dec(price)}"
 
     ws_trade.append_row(row, value_input_option="USER_ENTERED")
-    msg = (f"🚀 BOT ORO | {SYMBOL}\n"
+    msg = (f"BOT ORO | {SYMBOL}\n"
            f"Trade APERTO: {trade_id}\n"
            f"Side: {side}  Entry: {fmt_dec(price)}\n"
-           f"TP1 {fmt_dec(price*(1+TP1_PCT))} · TP2 {fmt_dec(price*(1+TP2_PCT))} · SL {fmt_dec(price*(1-SL_PCT))}\n"
+           f"TP1 {fmt_dec(price*(1+TP1_PCT))} - TP2 {fmt_dec(price*(1+TP2_PCT))} - SL {fmt_dec(price*(1-SL_PCT))}\n"
            f"{TIMEZONE}")
     log(ws_log,"INFO",f"Aperto trade {trade_id} @ {fmt_dec(price)}")
     notify(msg)
@@ -654,7 +727,7 @@ def ensure_min_open_trades(ws_trade, ws_log, client, H, col_ping,
                 _LAST_TRADE_TS = now_ts
                 _LAST_ENTRY_PRICE = used_price
                 log(ws_log, "INFO",
-                    f"Aperto trade automatico {trade_id} (min={min_trades}) · price={fmt_dec(used_price)}")
+                    f"Aperto trade automatico {trade_id} (min={min_trades}) - price={fmt_dec(used_price)}")
                 break
             except Exception as e:
                 log(ws_log, "ERROR", f"Apertura trade automatico fallita ({trade_id}): {e}")
@@ -670,10 +743,10 @@ def main_loop():
 
     # Startup log con versione e parametri principali
     log(ws_log, "INFO",
-        f"{BOT_VERSION} · SYMBOL={SYMBOL} · TZ={TIMEZONE} · "
-        f"TABS=({ws_trade.title},{ws_log.title}) · "
-        f"TP1={fmt_dec(TP1_PCT,'0.0000001')} TP2={fmt_dec(TP2_PCT,'0.0000001')} SL={fmt_dec(SL_PCT,'0.0000001')} · "
-        f"MIN_OPEN_TRADES={MIN_OPEN_TRADES} POLL={POLL_SECONDS}s · "
+        f"{BOT_VERSION} - SYMBOL={SYMBOL} - TZ={TIMEZONE} - "
+        f"TABS=({ws_trade.title},{ws_log.title}) - "
+        f"TP1={fmt_dec(TP1_PCT,'0.0000001')} TP2={fmt_dec(TP2_PCT,'0.0000001')} SL={fmt_dec(SL_PCT,'0.0000001')} - "
+        f"MIN_OPEN_TRADES={MIN_OPEN_TRADES} POLL={POLL_SECONDS}s - "
         f"COOLDOWN={MIN_TRADE_GAP_SECONDS}s DIST_BP={MIN_ENTRY_DISTANCE_BP} GRID_BP={GRID_STEP_BP}")
 
     header = get_header(ws_trade)
@@ -702,15 +775,21 @@ def main_loop():
                 time.sleep(BANNED_FALLBACK_SLEEP)
                 continue
 
-            # Una sola lettura prezzo per ciclo (throttlata e con cache)
+            # 1) Chiudi SUBITO le righe con 'Prezzo chiusura' compilato (no Binance)
+            close_rows_marked(ws_trade, ws_log, _H_CACHE)
+
+            # 2) Una sola lettura prezzo per ciclo (throttlata e con cache)
             lastp = get_last_price(client)
 
+            # 3) Riconciliazione saltuaria
             if time.time() - _LAST_RECONCILE_TS >= RECONCILE_MIN_SECONDS:
                 reconcile_and_notify_starts(ws_trade, ws_log, SYMBOL)
                 _LAST_RECONCILE_TS = time.time()
 
+            # 4) Aggiorna P&L / ping
             update_open_rows_light(ws_trade, ws_log, client, _H_CACHE, _COL_PING_CACHE, lastp=lastp)
 
+            # 5) Mantieni minimo aperti (con anti-clustering)
             ensure_min_open_trades(
                 ws_trade, ws_log, client,
                 H=_H_CACHE,
@@ -721,6 +800,7 @@ def main_loop():
                 last_price=lastp
             )
 
+            # 6) Heartbeat
             if lastp != 0 and should_log_heartbeat(lastp):
                 log(ws_log, "INFO", f"Heartbeat OK - {fmt_dec(lastp)}")
 
