@@ -9,7 +9,7 @@ from binance.exceptions import BinanceAPIException, BinanceRequestException
 from twilio.rest import Client as TwilioClient
 
 # ========= COSTANTI =========
-BOT_VERSION = "oro-bot v1.6"
+BOT_VERSION = "oro-bot v1.7"
 
 # ========= ENV =========
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
@@ -62,6 +62,9 @@ GRID_STEP_BP          = int(os.getenv("GRID_STEP_BP", "15"))            # passo 
 # === Anti rate-limit ===
 PRICE_MIN_INTERVAL = int(os.getenv("PRICE_MIN_INTERVAL", "3"))
 BANNED_FALLBACK_SLEEP = int(os.getenv("BANNED_FALLBACK_SLEEP", "30"))
+
+# === Tolleranza trigger (nuovo) ===
+HIT_TOL_BP = int(os.getenv("HIT_TOL_BP", "0"))  # basis points di tolleranza sui trigger TP/SL
 
 # Stato interno
 _LAST_HEADER_SIG = None
@@ -562,10 +565,19 @@ def update_open_rows_light(ws_trade, ws_log, client, H, col_ping, lastp=None):
     close_col_idx  = H.get("prezzo chiusura")
     delta_col_idx  = H.get("delta")
 
+    # Debounce: evita di chiudere due volte la stessa riga in questo batch
+    rows_already_closing = set()
+
     global _LAST_MISS_LOG_TS
+
+    # Tolleranza sui trigger in Decimal
+    tol = (Decimal(HIT_TOL_BP) / Decimal("10000")) if HIT_TOL_BP > 0 else Decimal("0")
 
     for i in range(n_rows):
         r = start_row + i
+        if r in rows_already_closing:
+            continue
+
         stato = (stato_col[i+1] if i+1 < len(stato_col) else "").strip().upper()
         side  = (side_col[i+1]  if i+1 < len(side_col)  else "LONG").strip().upper()
         entry_str = (entry_col[i+1] if i+1 < len(entry_col) else "").strip()
@@ -581,14 +593,15 @@ def update_open_rows_light(ws_trade, ws_log, client, H, col_ping, lastp=None):
         tp1, tp2, sl = compute_targets(entry)
         hit = None
         close_price = None
+
         if side == "LONG":
-            if lastp >= tp2: hit, close_price = "TP2", tp2
-            elif lastp >= tp1: hit, close_price = "TP1", tp1
-            elif lastp <= sl:  hit, close_price = "SL",  sl
+            if lastp >= (tp2 * (Decimal("1") - tol)): hit, close_price = "TP2", tp2
+            elif lastp >= (tp1 * (Decimal("1") - tol)): hit, close_price = "TP1", tp1
+            elif lastp <= (sl  * (Decimal("1") + tol)): hit, close_price = "SL",  sl
         else:
-            if lastp <= tp2: hit, close_price = "TP2", tp2
-            elif lastp <= tp1: hit, close_price = "TP1", tp1
-            elif lastp >= sl:  hit, close_price = "SL",  sl
+            if lastp <= (tp2 * (Decimal("1") + tol)): hit, close_price = "TP2", tp2
+            elif lastp <= (tp1 * (Decimal("1") + tol)): hit, close_price = "TP1", tp1
+            elif lastp >= (sl  * (Decimal("1") - tol)): hit, close_price = "SL",  sl
 
         if not hit:
             pnl_pct, pnl_val = pnl_values(side, entry, lastp, qty)
@@ -612,6 +625,9 @@ def update_open_rows_light(ws_trade, ws_log, client, H, col_ping, lastp=None):
                     f"Nessuna chiusura r{r}: side={side} entry={fmt_dec(entry)} last={fmt_dec(lastp)} "
                     f"tp1={fmt_dec(tp1)} tp2={fmt_dec(tp2)} sl={fmt_dec(sl)} qty={fmt_dec(qty,'0.00000001')}")
             continue
+
+        # Segna che questa riga sta chiudendo (debounce)
+        rows_already_closing.add(r)
 
         # Chiusura per TP/SL
         pnl_pct, pnl_val = pnl_values(side, entry, close_price, qty)
@@ -777,7 +793,8 @@ def main_loop():
         f"TABS=({ws_trade.title},{ws_log.title}) - "
         f"TP1={fmt_dec(TP1_PCT,'0.0000001')} TP2={fmt_dec(TP2_PCT,'0.0000001')} SL={fmt_dec(SL_PCT,'0.0000001')} - "
         f"MIN_OPEN_TRADES={MIN_OPEN_TRADES} POLL={POLL_SECONDS}s - "
-        f"COOLDOWN={MIN_TRADE_GAP_SECONDS}s DIST_BP={MIN_ENTRY_DISTANCE_BP} GRID_BP={GRID_STEP_BP}")
+        f"COOLDOWN={MIN_TRADE_GAP_SECONDS}s DIST_BP={MIN_ENTRY_DISTANCE_BP} GRID_BP={GRID_STEP_BP} - "
+        f"HIT_TOL_BP={HIT_TOL_BP}")
 
     header = get_header(ws_trade)
     _H_CACHE = build_header_map(header)
@@ -786,7 +803,7 @@ def main_loop():
     dump_headers_once(ws_trade, ws_log)
 
     reconcile_and_notify_starts(ws_trade, ws_log, SYMBOL)
-    process_manual_closes(ws_trade, ws_log, _H_CACHE)   # <<-- nuovo: gestisci chiusure manuali subito
+    process_manual_closes(ws_trade, ws_log, _H_CACHE)   # gestisci chiusure manuali subito
     _LAST_RECONCILE_TS = time.time()
 
     if AUTO_OPEN_ON_START:
@@ -812,7 +829,7 @@ def main_loop():
             # Riconcilio periodico + chiusure manuali
             if time.time() - _LAST_RECONCILE_TS >= RECONCILE_MIN_SECONDS:
                 reconcile_and_notify_starts(ws_trade, ws_log, SYMBOL)
-                process_manual_closes(ws_trade, ws_log, _H_CACHE)   # <<-- nuovo: anche periodico
+                process_manual_closes(ws_trade, ws_log, _H_CACHE)
                 _LAST_RECONCILE_TS = time.time()
 
             update_open_rows_light(ws_trade, ws_log, client, _H_CACHE, _COL_PING_CACHE, lastp=lastp)
