@@ -54,7 +54,7 @@ HEARTBEAT_PRICE_DELTA_BP = int(os.getenv("HEARTBEAT_PRICE_DELTA_BP", "2"))
 # Riconciliazione meno frequente (per ridurre letture)
 RECONCILE_MIN_SECONDS = int(os.getenv("RECONCILE_MIN_SECONDS", "180"))
 
-# === Anti-clustering esistente ===
+# === Anti-clustering ===
 MIN_TRADE_GAP_SECONDS = int(os.getenv("MIN_TRADE_GAP_SECONDS", "180"))
 MIN_ENTRY_DISTANCE_BP = int(os.getenv("MIN_ENTRY_DISTANCE_BP", "12"))
 GRID_STEP_BP          = int(os.getenv("GRID_STEP_BP", "15"))
@@ -165,15 +165,18 @@ def notify(msg: str):
 
 # ========= SHEETS =========
 def open_ws_by_title(sh, title: str):
-    try: return sh.worksheet(title)
+    try:
+        return sh.worksheet(title)
     except gspread.WorksheetNotFound:
         raise RuntimeError(f"Tab '{title}' non trovata. Imposta SHEET_TAB_* correttamente.")
 
 def open_sheets():
-    if not GOOGLE_CREDENTIALS: raise RuntimeError("GOOGLE_CREDENTIALS mancante.")
+    if not GOOGLE_CREDENTIALS:
+        raise RuntimeError("GOOGLE_CREDENTIALS mancante.")
     creds = ServiceAccountCredentials.from_json_keyfile_dict(
         json.loads(GOOGLE_CREDENTIALS),
-        ["https://spreadsheets.google.com/feeds","https://www.googleapis.com/auth/drive"]
+        ["https://spreadsheets.google.com/feeds",
+         "https://www.googleapis.com/auth/drive"]
     )
     gc = gspread.authorize(creds)
     sh = gc.open_by_key(SPREADSHEET_ID)
@@ -204,12 +207,14 @@ def build_header_map(header_row):
         n=norm(name)
         for canon,alts in ALIAS.items():
             if n==norm(canon) or n in [norm(a) for a in alts]:
-                H[canon]=idx; break
+                H[canon]=idx
+                break
     return H
 
 def get_header(ws):
-    header=ws.row_values(1)
-    if not header: raise RuntimeError(f"La tab '{ws.title}' non ha intestazioni.")
+    header = ws.row_values(1)
+    if not header:
+        raise RuntimeError(f"La tab '{ws.title}' non ha intestazioni.")
     return header
 
 def header_signature(header_row):
@@ -217,21 +222,25 @@ def header_signature(header_row):
 
 def dump_headers_once(ws_trade, ws_log):
     global _LAST_HEADER_SIG
-    if not DEBUG_HEADERS: return
+    if not DEBUG_HEADERS:
+        return
     header = ws_trade.row_values(1)
     sig = header_signature(header)
     if sig != _LAST_HEADER_SIG:
         _LAST_HEADER_SIG = sig
         try:
-            ws_log.append_row([now_local_str(), "INFO", f"[DEBUG] Header Trade raw: {header}", "bot"], value_input_option="USER_ENTERED")
+            ws_log.append_row([now_local_str(), "INFO", f"[DEBUG] Header Trade raw: {header}", "bot"],
+                              value_input_option="USER_ENTERED")
             H = build_header_map(header)
-            ws_log.append_row([now_local_str(), "INFO", f"[DEBUG] Header mappati: {sorted(list(H.keys()))}", "bot"], value_input_option="USER_ENTERED")
+            ws_log.append_row([now_local_str(), "INFO", f"[DEBUG] Header mappati: {sorted(list(H.keys()))}", "bot"],
+                              value_input_option="USER_ENTERED")
         except Exception as e:
             print("[DEBUG] dump_headers_once error:", e)
 
 def find_col_by_header(ws, header_name: str) -> int:
     header = ws.row_values(1)
-    if not header: raise RuntimeError(f"La tab '{ws.title}' non ha intestazioni.")
+    if not header:
+        raise RuntimeError(f"La tab '{ws.title}' non ha intestazioni.")
     target = (header_name or "").strip().lower()
     for i, h in enumerate(header, start=1):
         if (h or "").strip().lower() == target:
@@ -280,7 +289,8 @@ def compute_targets(entry: Decimal):
     return (entry*(1+TP1_PCT), entry*(1+TP2_PCT), entry*(1-SL_PCT))
 
 def pnl_values(side, entry, close, qty):
-    if qty==0 or entry==0 or close==0: return (Decimal("0"), Decimal("0"))
+    if qty==0 or entry==0 or close==0:
+        return (Decimal("0"), Decimal("0"))
     if side.upper()=="LONG":
         return ((close/entry-1)*100, (close-entry)*qty)
     else:
@@ -291,13 +301,15 @@ def pnl_values(side, entry, close, qty):
 def log_get_messages(ws_log, max_rows=2000):
     try:
         msgs = ws_log.col_values(3)
-        if len(msgs) <= 1: return set()
+        if len(msgs) <= 1:
+            return set()
         return set(msgs[-max_rows:])
     except Exception:
         return set()
 
 def start_already_notified(log_msgs: set, trade_id: str) -> bool:
-    if not trade_id: return False
+    if not trade_id:
+        return False
     key = f"Aperto trade {trade_id}"
     for m in log_msgs:
         if trade_id in m and "Aperto trade" in m: return True
@@ -321,7 +333,8 @@ def reconcile_and_notify_starts(ws_trade, ws_log, symbol: str):
     L_TP1 = H.get("tp1 %"); L_TP2 = H.get("tp2 %"); L_SL = H.get("sl %")
 
     rows = ws_trade.get_all_values()
-    if len(rows) <= 1: return
+    if len(rows) <= 1:
+        return
 
     log_msgs = log_get_messages(ws_log)
     updates = []
@@ -336,18 +349,22 @@ def reconcile_and_notify_starts(ws_trade, ws_log, symbol: str):
         close_str = (row[L_CLOSE - 1] if L_CLOSE and len(row) >= L_CLOSE else "").strip()
         has_close = bool(close_str)
 
+        # Stato coerente con eventuale "prezzo chiusura"
         if has_close and stato in ("", "APERTO"):
             updates.append({"range": gspread.utils.rowcol_to_a1(r, L_STATO), "values": [["CHIUSO"]]})
             stato = "CHIUSO"
 
+        # Entry presente ma stato vuoto -> APERTO
         if entry_str and stato == "":
             updates.append({"range": gspread.utils.rowcol_to_a1(r, L_STATO), "values": [["APERTO"]]})
             stato = "APERTO"
 
+        # Genera ID se manca
         if stato == "APERTO" and not trade_id:
             trade_id = gen_trade_id(symbol, r)
             updates.append({"range": gspread.utils.rowcol_to_a1(r, L_ID), "values": [[trade_id]]})
 
+        # Notifica una sola volta l'apertura riconosciuta
         if stato == "APERTO" and entry > 0 and not start_already_notified(log_msgs, trade_id):
             TP1 = d(row[L_TP1 - 1]) if L_TP1 and len(row) >= L_TP1 and (row[L_TP1 - 1] or "").strip() else TP1_PCT
             TP2 = d(row[L_TP2 - 1]) if L_TP2 and len(row) >= L_TP2 and (row[L_TP2 - 1] or "").strip() else TP2_PCT
@@ -392,6 +409,7 @@ def process_manual_closes(ws_trade, ws_log, H):
     for r in range(2, len(rows)+1):
         row = rows[r-1]
         trade_id = (row[H["id trade"]-1] if "id trade" in H and len(row) >= H["id trade"] else "").strip()
+
         stato = (row[stato_col_idx-1] if len(row) >= stato_col_idx else "").strip().upper()
         entry_str = (row[entry_idx-1] if len(row) >= entry_idx else "").strip()
         close_str = (row[close_idx-1] if len(row) >= close_idx else "").strip()
@@ -430,18 +448,18 @@ def process_manual_closes(ws_trade, ws_log, H):
                 updates.append({"range": gspread.utils.rowcol_to_a1(r, note_idx), "values": [["MANUAL"]]})
 
         log(ws_log, "INFO",
-    f"Chiusura MANUAL r{r} id={trade_id} - side={side} entry={fmt_dec(entry)} close={fmt_dec(close)} "
-    f"pnl%={fmt_dec(pnl_pct,'0.0001')} pnl=${fmt_dec(pnl_val,'0.01')} "
-    f"equity->{fmt_dec(eq_new,'0.01')}")
+            f"Chiusura MANUAL r{r} id={trade_id} - side={side} entry={fmt_dec(entry)} close={fmt_dec(close)} "
+            f"pnl%={fmt_dec(pnl_pct,'0.0001')} pnl=${fmt_dec(pnl_val,'0.01')} "
+            f"equity->{fmt_dec(eq_new,'0.01')}")
 
-notify(
-    f"BOT ORO | {SYMBOL}\n"
-    f"Chiusura manuale\n"
-    f"ID: {trade_id}\n"
-    f"Entry: {fmt_dec(entry)}  Close: {fmt_dec(close)}\n"
-    f"P&L: {fmt_dec(pnl_val,'0.01')} USD  ({fmt_dec(pnl_pct,'0.0001')}%)\n"
-    f"Equity: {fmt_dec(eq_new,'0.01')} - {TIMEZONE}"
-)
+        notify(
+            f"BOT ORO | {SYMBOL}\n"
+            f"Chiusura manuale\n"
+            f"ID: {trade_id}\n"
+            f"Entry: {fmt_dec(entry)}  Close: {fmt_dec(close)}\n"
+            f"P&L: {fmt_dec(pnl_val,'0.01')} USD  ({fmt_dec(pnl_pct,'0.0001')}%)\n"
+            f"Equity: {fmt_dec(eq_new,'0.01')} - {TIMEZONE}"
+        )
 
     if updates:
         ws_trade.spreadsheet.values_batch_update({"valueInputOption": "USER_ENTERED", "data": updates})
@@ -451,10 +469,12 @@ notify(
 def last_equity(ws, idx_equity) -> Decimal:
     col = ws.col_values(idx_equity)
     for v in reversed(col[1:]):
-        v=(v or "").strip()
+        v = (v or "").strip()
         if v:
-            try: return d(v)
-            except: continue
+            try:
+                return d(v)
+            except:
+                continue
     return BASE_EQUITY
 
 def log(ws_log, level, msg):
@@ -467,16 +487,19 @@ def should_log_heartbeat(price: Decimal) -> bool:
     global _LAST_HEARTBEAT_TS, _LAST_HEARTBEAT_PRICE
     now_ts = time.time()
     if _LAST_HEARTBEAT_TS == 0 or _LAST_HEARTBEAT_PRICE is None:
-        _LAST_HEARTBEAT_TS = now_ts; _LAST_HEARTBEAT_PRICE = price
+        _LAST_HEARTBEAT_TS = now_ts
+        _LAST_HEARTBEAT_PRICE = price
         return True
     if now_ts - _LAST_HEARTBEAT_TS >= HEARTBEAT_MIN_SECONDS:
-        _LAST_HEARTBEAT_TS = now_ts; _LAST_HEARTBEAT_PRICE = price
+        _LAST_HEARTBEAT_TS = now_ts
+        _LAST_HEARTBEAT_PRICE = price
         return True
     try:
         if price > 0 and _LAST_HEARTBEAT_PRICE > 0:
             move_bp = abs((price - _LAST_HEARTBEAT_PRICE) / _LAST_HEARTBEAT_PRICE) * 10000
             if move_bp >= HEARTBEAT_PRICE_DELTA_BP:
-                _LAST_HEARTBEAT_TS = now_ts; _LAST_HEARTBEAT_PRICE = price
+                _LAST_HEARTBEAT_TS = now_ts
+                _LAST_HEARTBEAT_PRICE = price
                 return True
     except Exception:
         pass
@@ -515,6 +538,7 @@ def update_open_rows_light(ws_trade, ws_log, client, H, col_ping, lastp=None):
     qty_col   = ws_trade.col_values(H["qty"])  if "qty" in H  else []
     close_col = ws_trade.col_values(H["prezzo chiusura"]) if "prezzo chiusura" in H else []
     id_col    = ws_trade.col_values(H["id trade"]) if "id trade" in H else []
+
     plpct_col_idx  = H["p&l %"]
     plval_col_idx  = H["p&l valore"]
     equity_col_idx = H["equity post-trade"]
@@ -540,7 +564,8 @@ def update_open_rows_light(ws_trade, ws_log, client, H, col_ping, lastp=None):
         entry_str = (entry_col[i+1] if i+1 < len(entry_col) else "").strip()
         qty_str   = (qty_col[i+1]   if i+1 < len(qty_col)   else "").strip()
         close_str = (close_col[i+1] if i+1 < len(close_col) else "").strip()
-        trade_id = (id_col[i+1] if i+1 < len(id_col) else "").strip()
+        trade_id  = (id_col[i+1] if i+1 < len(id_col) else "").strip()
+
         entry = d(entry_str) if entry_str else Decimal("0")
         qty   = d(qty_str) if qty_str else Decimal("1")
 
@@ -592,7 +617,7 @@ def update_open_rows_light(ws_trade, ws_log, client, H, col_ping, lastp=None):
                     f"tp1={fmt_dec(tp1)} tp2={fmt_dec(tp2)} sl={fmt_dec(sl)} qty={fmt_dec(qty,'0.00000001')}")
             continue
 
-        # Debounce
+        # Debounce: sta chiudendo questa riga
         rows_already_closing.add(r)
 
         # Chiusura per TP/SL
@@ -615,20 +640,20 @@ def update_open_rows_light(ws_trade, ws_log, client, H, col_ping, lastp=None):
         ]
 
         # --- LOG con ID trade ---
-log(ws_log, "INFO",
-    f"Close {hit} r{r} id={trade_id} - side={side} entry={fmt_dec(entry)} "
-    f"close={fmt_dec(close_price)} pnl%={fmt_dec(pnl_pct,'0.0001')} "
-    f"pnl=${fmt_dec(pnl_val,'0.01')} eq->{fmt_dec(eq_new,'0.01')}")
+        log(ws_log, "INFO",
+            f"Close {hit} r{r} id={trade_id} - side={side} entry={fmt_dec(entry)} "
+            f"close={fmt_dec(close_price)} pnl%={fmt_dec(pnl_pct,'0.0001')} "
+            f"pnl=${fmt_dec(pnl_val,'0.01')} eq->{fmt_dec(eq_new,'0.01')}")
 
-# --- NOTIFICA con ID trade ---
-notify(
-    f"BOT ORO | {SYMBOL}\n"
-    f"Trade chiuso: {hit}\n"
-    f"ID: {trade_id}\n"
-    f"Entry: {fmt_dec(entry)}  Close: {fmt_dec(close_price)}\n"
-    f"P&L: {fmt_dec(pnl_val,'0.01')} USD  ({fmt_dec(pnl_pct,'0.0001')}%)\n"
-    f"Equity: {fmt_dec(eq_new,'0.01')} - {TIMEZONE}"
-)
+        # --- NOTIFICA con ID trade ---
+        notify(
+            f"BOT ORO | {SYMBOL}\n"
+            f"Trade chiuso: {hit}\n"
+            f"ID: {trade_id}\n"
+            f"Entry: {fmt_dec(entry)}  Close: {fmt_dec(close_price)}\n"
+            f"P&L: {fmt_dec(pnl_val,'0.01')} USD  ({fmt_dec(pnl_pct,'0.0001')}%)\n"
+            f"Equity: {fmt_dec(eq_new,'0.01')} - {TIMEZONE}"
+        )
 
     if updates:
         ws_trade.spreadsheet.values_batch_update({"valueInputOption": "USER_ENTERED", "data": updates})
@@ -640,7 +665,8 @@ def open_new_trade(ws_trade, ws_log, trade_id: str, side="LONG", qty=Decimal("1"
         header = get_header(ws_trade); H = build_header_map(header)
     need=["data/ora","id trade","lato","stato","prezzo ingresso","qty","sl %","tp1 %","tp2 %","ultimo ping"]
     for k in need:
-        if k not in H: raise RuntimeError(f"Colonna '{k}' mancante per aprire un trade.")
+        if k not in H:
+            raise RuntimeError(f"Colonna '{k}' mancante per aprire un trade.")
 
     if entry_price is None:
         price = get_last_price(binance_client())
@@ -667,29 +693,35 @@ def open_new_trade(ws_trade, ws_log, trade_id: str, side="LONG", qty=Decimal("1"
     row[col_ping-1] = f"{now_local_str()} - {fmt_dec(price)}"
 
     # --- DEBUG: prima dell'append, dove stiamo scrivendo e quante righe ci sono ---
-try:
-    rows_before = len(ws_trade.get_all_values())
-    log(ws_log, "DEBUG",
-        f"[OPEN] sheet='{ws_trade.spreadsheet.title}' tab='{ws_trade.title}' rows_before={rows_before}")
-except Exception as e:
-    log(ws_log, "DEBUG", f"[OPEN] pre-append inspect failed: {e}")
+    try:
+        rows_before = len(ws_trade.get_all_values())
+        log(ws_log, "DEBUG",
+            f"[OPEN] sheet='{ws_trade.spreadsheet.title}' tab='{ws_trade.title}' rows_before={rows_before}")
+    except Exception as e:
+        log(ws_log, "DEBUG", f"[OPEN] pre-append inspect failed: {e}")
 
-# --- APPEND con gestione errori e traccia della riga ---
-try:
-    ws_trade.append_row(row, value_input_option="USER_ENTERED")
-    print("[DEBUG] append_row OK:", row)
-    log(ws_log, "DEBUG", f"[OPEN] append_row OK id={trade_id} row={row}")
-except Exception as e:
-    log(ws_log, "ERROR", f"[OPEN] append_row failed id={trade_id}: {e}")
-    raise
+    # --- APPEND robusto via values_append ---
+    try:
+        rng = f"'{ws_trade.title}'!A1"
+        ws_trade.spreadsheet.values_append(
+            rng,
+            params={"valueInputOption": "USER_ENTERED", "insertDataOption": "INSERT_ROWS"},
+            body={"values": [row]},
+        )
+        log(ws_log, "DEBUG", f"[OPEN] values_append OK id={trade_id}")
+    except Exception as e:
+        log(ws_log, "ERROR", f"[OPEN] values_append FAILED id={trade_id}: {e}")
+        raise
 
-# --- DEBUG: dopo l'append, verifico che sia stata aggiunta una riga ---
-try:
-    rows_after = len(ws_trade.get_all_values())
-    log(ws_log, "DEBUG",
-        f"[OPEN] id={trade_id} rows_after={rows_after} delta={rows_after - rows_before}")
-except Exception as e:
-    log(ws_log, "DEBUG", f"[OPEN] post-append inspect failed: {e}")
+    # --- DEBUG: dopo l'append, verifico che sia stata aggiunta una riga ---
+    try:
+        rows_after = len(ws_trade.get_all_values())
+        log(ws_log, "DEBUG",
+            f"[OPEN] id={trade_id} rows_after={rows_after} delta={rows_after - rows_before}")
+    except Exception as e:
+        log(ws_log, "DEBUG", f"[OPEN] post-append inspect failed: {e}")
+
+    # Notifica apertura
     msg = (f"BOT ORO | {SYMBOL}\n"
            f"Trade APERTO: {trade_id}\n"
            f"Side: {side}  Entry: {fmt_dec(price)}\n"
@@ -724,6 +756,7 @@ def ensure_min_open_trades(ws_trade, ws_log, client, H, col_ping,
             log(ws_log, "WARN", "Prezzo 0 da Binance (skip open)")
             return
 
+        # Distanza minima da altri APERTI
         open_entries = []
         entry_col = ws_trade.col_values(H["prezzo ingresso"])
         if len(stato_col) > 1:
@@ -742,6 +775,7 @@ def ensure_min_open_trades(ws_trade, ws_log, client, H, col_ping,
                     f"Skip open: distanza < {MIN_ENTRY_DISTANCE_BP}bp da un entry aperto (last={fmt_dec(lastp)})")
                 return
 
+        # Grid step rispetto all'ultimo aperto
         if GRID_STEP_BP > 0 and _LAST_ENTRY_PRICE:
             move_bp = abs((lastp - _LAST_ENTRY_PRICE) / _LAST_ENTRY_PRICE) * 10000
             if move_bp < GRID_STEP_BP:
@@ -749,6 +783,7 @@ def ensure_min_open_trades(ws_trade, ws_log, client, H, col_ping,
                     f"Skip open: grid step {move_bp:.1f}bp < {GRID_STEP_BP}bp (ultimo={fmt_dec(_LAST_ENTRY_PRICE)} last={fmt_dec(lastp)})")
                 return
 
+        # Apri i mancanti (al max 1 per giro grazie ai filtri)
         for i in range(to_open):
             trade_id = f"{SYMBOL}-{int(time.time())}-AUTO{i}"
             try:
@@ -776,6 +811,7 @@ def main_loop():
     ws_trade, ws_log = open_sheets()
     client = binance_client()
 
+    # Startup log con versione e parametri principali
     log(ws_log, "INFO",
         f"{BOT_VERSION} - SYMBOL={SYMBOL} - TZ={TIMEZONE} - "
         f"TABS=({ws_trade.title},{ws_log.title}) - "
@@ -804,14 +840,17 @@ def main_loop():
 
     while True:
         try:
+            # Se in ban, pausa gentile e riprova
             if time.time() < _BINANCE_BANNED_UNTIL:
                 ts = datetime.fromtimestamp(_BINANCE_BANNED_UNTIL).strftime('%Y-%m-%d %H:%M:%S')
                 log(ws_log, "WARN", f"Binance bannato fino a {ts}. Sleep {BANNED_FALLBACK_SLEEP}s")
                 time.sleep(BANNED_FALLBACK_SLEEP)
                 continue
 
+            # Una sola lettura prezzo per ciclo (throttlata e con cache)
             lastp = get_last_price(client)
 
+            # Riconcilio periodico + chiusure manuali
             if time.time() - _LAST_RECONCILE_TS >= RECONCILE_MIN_SECONDS:
                 reconcile_and_notify_starts(ws_trade, ws_log, SYMBOL)
                 process_manual_closes(ws_trade, ws_log, _H_CACHE)
