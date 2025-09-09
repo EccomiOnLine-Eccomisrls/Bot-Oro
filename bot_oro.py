@@ -391,7 +391,7 @@ def process_manual_closes(ws_trade, ws_log, H):
     updates = []
     for r in range(2, len(rows)+1):
         row = rows[r-1]
-
+        trade_id = (row[H["id trade"]-1] if "id trade" in H and len(row) >= H["id trade"] else "").strip()
         stato = (row[stato_col_idx-1] if len(row) >= stato_col_idx else "").strip().upper()
         entry_str = (row[entry_idx-1] if len(row) >= entry_idx else "").strip()
         close_str = (row[close_idx-1] if len(row) >= close_idx else "").strip()
@@ -430,17 +430,18 @@ def process_manual_closes(ws_trade, ws_log, H):
                 updates.append({"range": gspread.utils.rowcol_to_a1(r, note_idx), "values": [["MANUAL"]]})
 
         log(ws_log, "INFO",
-            f"Chiusura MANUAL r{r} - side={side} entry={fmt_dec(entry)} close={fmt_dec(close)} "
-            f"pnl%={fmt_dec(pnl_pct,'0.0001')} pnl=${fmt_dec(pnl_val,'0.01')} "
-            f"equity->{fmt_dec(eq_new,'0.01')}")
+    f"Chiusura MANUAL r{r} id={trade_id} - side={side} entry={fmt_dec(entry)} close={fmt_dec(close)} "
+    f"pnl%={fmt_dec(pnl_pct,'0.0001')} pnl=${fmt_dec(pnl_val,'0.01')} "
+    f"equity->{fmt_dec(eq_new,'0.01')}")
 
-        notify(
-            f"BOT ORO | {SYMBOL}\n"
-            f"Chiusura manuale\n"
-            f"Entry: {fmt_dec(entry)}  Close: {fmt_dec(close)}\n"
-            f"P&L: {fmt_dec(pnl_val,'0.01')} USD  ({fmt_dec(pnl_pct,'0.0001')}%)\n"
-            f"Equity: {fmt_dec(eq_new,'0.01')} - {TIMEZONE}"
-        )
+notify(
+    f"BOT ORO | {SYMBOL}\n"
+    f"Chiusura manuale\n"
+    f"ID: {trade_id}\n"
+    f"Entry: {fmt_dec(entry)}  Close: {fmt_dec(close)}\n"
+    f"P&L: {fmt_dec(pnl_val,'0.01')} USD  ({fmt_dec(pnl_pct,'0.0001')}%)\n"
+    f"Equity: {fmt_dec(eq_new,'0.01')} - {TIMEZONE}"
+)
 
     if updates:
         ws_trade.spreadsheet.values_batch_update({"valueInputOption": "USER_ENTERED", "data": updates})
@@ -513,7 +514,7 @@ def update_open_rows_light(ws_trade, ws_log, client, H, col_ping, lastp=None):
     entry_col = ws_trade.col_values(H["prezzo ingresso"])
     qty_col   = ws_trade.col_values(H["qty"])  if "qty" in H  else []
     close_col = ws_trade.col_values(H["prezzo chiusura"]) if "prezzo chiusura" in H else []
-
+    id_col    = ws_trade.col_values(H["id trade"]) if "id trade" in H else []
     plpct_col_idx  = H["p&l %"]
     plval_col_idx  = H["p&l valore"]
     equity_col_idx = H["equity post-trade"]
@@ -539,7 +540,7 @@ def update_open_rows_light(ws_trade, ws_log, client, H, col_ping, lastp=None):
         entry_str = (entry_col[i+1] if i+1 < len(entry_col) else "").strip()
         qty_str   = (qty_col[i+1]   if i+1 < len(qty_col)   else "").strip()
         close_str = (close_col[i+1] if i+1 < len(close_col) else "").strip()
-
+        trade_id = (id_col[i+1] if i+1 < len(id_col) else "").strip()
         entry = d(entry_str) if entry_str else Decimal("0")
         qty   = d(qty_str) if qty_str else Decimal("1")
 
@@ -613,18 +614,21 @@ def update_open_rows_light(ws_trade, ws_log, client, H, col_ping, lastp=None):
             {"range": gspread.utils.rowcol_to_a1(r, equity_col_idx), "values": [[fmt_dec(eq_new, "0.01")]]},
         ]
 
-        log(ws_log, "INFO",
-            f"Close {hit} r{r} - side={side} entry={fmt_dec(entry)} "
-            f"close={fmt_dec(close_price)} pnl%={fmt_dec(pnl_pct,'0.0001')} "
-            f"pnl=${fmt_dec(pnl_val,'0.01')} eq->{fmt_dec(eq_new,'0.01')}")
+        # --- LOG con ID trade ---
+log(ws_log, "INFO",
+    f"Close {hit} r{r} id={trade_id} - side={side} entry={fmt_dec(entry)} "
+    f"close={fmt_dec(close_price)} pnl%={fmt_dec(pnl_pct,'0.0001')} "
+    f"pnl=${fmt_dec(pnl_val,'0.01')} eq->{fmt_dec(eq_new,'0.01')}")
 
-        notify(
-            f"BOT ORO | {SYMBOL}\n"
-            f"Trade chiuso: {hit}\n"
-            f"Entry: {fmt_dec(entry)}  Close: {fmt_dec(close_price)}\n"
-            f"P&L: {fmt_dec(pnl_val,'0.01')} USD  ({fmt_dec(pnl_pct,'0.0001')}%)\n"
-            f"Equity: {fmt_dec(eq_new,'0.01')} - {TIMEZONE}"
-        )
+# --- NOTIFICA con ID trade ---
+notify(
+    f"BOT ORO | {SYMBOL}\n"
+    f"Trade chiuso: {hit}\n"
+    f"ID: {trade_id}\n"
+    f"Entry: {fmt_dec(entry)}  Close: {fmt_dec(close_price)}\n"
+    f"P&L: {fmt_dec(pnl_val,'0.01')} USD  ({fmt_dec(pnl_pct,'0.0001')}%)\n"
+    f"Equity: {fmt_dec(eq_new,'0.01')} - {TIMEZONE}"
+)
 
     if updates:
         ws_trade.spreadsheet.values_batch_update({"valueInputOption": "USER_ENTERED", "data": updates})
