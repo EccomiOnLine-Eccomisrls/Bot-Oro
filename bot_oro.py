@@ -666,7 +666,30 @@ def open_new_trade(ws_trade, ws_log, trade_id: str, side="LONG", qty=Decimal("1"
         col_ping = find_col_by_header(ws_trade, "Ultimo ping")
     row[col_ping-1] = f"{now_local_str()} - {fmt_dec(price)}"
 
+    # --- DEBUG: prima dell'append, dove stiamo scrivendo e quante righe ci sono ---
+try:
+    rows_before = len(ws_trade.get_all_values())
+    log(ws_log, "DEBUG",
+        f"[OPEN] sheet='{ws_trade.spreadsheet.title}' tab='{ws_trade.title}' rows_before={rows_before}")
+except Exception as e:
+    log(ws_log, "DEBUG", f"[OPEN] pre-append inspect failed: {e}")
+
+# --- APPEND con gestione errori e traccia della riga ---
+try:
     ws_trade.append_row(row, value_input_option="USER_ENTERED")
+    print("[DEBUG] append_row OK:", row)
+    log(ws_log, "DEBUG", f"[OPEN] append_row OK id={trade_id} row={row}")
+except Exception as e:
+    log(ws_log, "ERROR", f"[OPEN] append_row failed id={trade_id}: {e}")
+    raise
+
+# --- DEBUG: dopo l'append, verifico che sia stata aggiunta una riga ---
+try:
+    rows_after = len(ws_trade.get_all_values())
+    log(ws_log, "DEBUG",
+        f"[OPEN] id={trade_id} rows_after={rows_after} delta={rows_after - rows_before}")
+except Exception as e:
+    log(ws_log, "DEBUG", f"[OPEN] post-append inspect failed: {e}")
     msg = (f"BOT ORO | {SYMBOL}\n"
            f"Trade APERTO: {trade_id}\n"
            f"Side: {side}  Entry: {fmt_dec(price)}\n"
