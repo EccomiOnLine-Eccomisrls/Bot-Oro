@@ -55,16 +55,16 @@ HEARTBEAT_PRICE_DELTA_BP = int(os.getenv("HEARTBEAT_PRICE_DELTA_BP", "2"))
 RECONCILE_MIN_SECONDS = int(os.getenv("RECONCILE_MIN_SECONDS", "180"))
 
 # === Anti-clustering esistente ===
-MIN_TRADE_GAP_SECONDS = int(os.getenv("MIN_TRADE_GAP_SECONDS", "180"))  # cooldown temporale
-MIN_ENTRY_DISTANCE_BP = int(os.getenv("MIN_ENTRY_DISTANCE_BP", "12"))   # distanza minima da altri APERTI
-GRID_STEP_BP          = int(os.getenv("GRID_STEP_BP", "15"))            # passo minimo vs ultimo aperto (0=off)
+MIN_TRADE_GAP_SECONDS = int(os.getenv("MIN_TRADE_GAP_SECONDS", "180"))
+MIN_ENTRY_DISTANCE_BP = int(os.getenv("MIN_ENTRY_DISTANCE_BP", "12"))
+GRID_STEP_BP          = int(os.getenv("GRID_STEP_BP", "15"))
 
 # === Anti rate-limit ===
 PRICE_MIN_INTERVAL = int(os.getenv("PRICE_MIN_INTERVAL", "3"))
 BANNED_FALLBACK_SLEEP = int(os.getenv("BANNED_FALLBACK_SLEEP", "30"))
 
 # === Tolleranza trigger (nuovo) ===
-HIT_TOL_BP = int(os.getenv("HIT_TOL_BP", "0"))  # basis points di tolleranza sui trigger TP/SL
+HIT_TOL_BP = int(os.getenv("HIT_TOL_BP", "0"))
 
 # Stato interno
 _LAST_HEADER_SIG = None
@@ -92,53 +92,31 @@ _BINANCE_BANNED_UNTIL = 0.0   # epoch seconds
 
 # ========= UTILS =========
 def d(x) -> Decimal:
-    """
-    Converte varie forme in Decimal.
-    Gestisce anche casi sporchi: '3.370,00', '3370.00.00', ' 3 370 . 00 '.
-    - Ritorna Decimal('0') se non interpretabile.
-    - Supporta percentuali (es. '0,02%').
-    """
     if isinstance(x, Decimal):
         return x
     if x is None:
         return Decimal("0")
-
     s = str(x).strip()
     if not s:
         return Decimal("0")
-
-    # percentuali
     is_percent = s.endswith("%")
     if is_percent:
         s = s[:-1].strip()
-
-    # togli spazi
-    s = s.replace(" ", "")
-
-    # se ci sono virgole, trattale come decimali (it-IT) e converti a punto
-    s = s.replace(",", ".")
-
-    # se ci sono PIÙ punti decimali (es. '3370.00.00'), tieni solo i primi due blocchi
+    s = s.replace(" ", "").replace(",", ".")
     if s.count(".") > 1:
         parts = s.split(".")
         s = parts[0] + "." + parts[1]
-
-    # pulizia finale: solo cifre e al massimo un punto
-    cleaned = []
-    dot_used = False
+    cleaned, dot_used = [], False
     for ch in s:
         if ch.isdigit():
             cleaned.append(ch)
         elif ch == "." and not dot_used:
-            cleaned.append(ch)
-            dot_used = True
+            cleaned.append(ch); dot_used = True
     s = "".join(cleaned) if cleaned else "0"
-
     try:
         val = Decimal(s)
     except Exception:
         return Decimal("0")
-
     if is_percent:
         val = val / Decimal("100")
     return val
@@ -266,20 +244,12 @@ def binance_client():
     return BinanceClient(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
 
 def get_last_price(client) -> Decimal:
-    """
-    Lettura prezzo con:
-    - cache & throttle (PRICE_MIN_INTERVAL)
-    - ban guard su errori -1003 con pausa fino a _BINANCE_BANNED_UNTIL
-    """
     global _PRICE_CACHE, _PRICE_CACHE_TS, _BINANCE_BANNED_UNTIL
-
     now_ts = time.time()
     if now_ts < _BINANCE_BANNED_UNTIL:
         return d(_PRICE_CACHE) if _PRICE_CACHE is not None else Decimal("0")
-
     if _PRICE_CACHE is not None and (now_ts - _PRICE_CACHE_TS) < PRICE_MIN_INTERVAL:
         return d(_PRICE_CACHE)
-
     try:
         p = client.get_symbol_ticker(symbol=SYMBOL)
         price = d(p["price"])
@@ -298,7 +268,6 @@ def get_last_price(client) -> Decimal:
                 _BINANCE_BANNED_UNTIL = now_ts + 300
         elif "-1003" in msg or "Too much request weight" in msg:
             _BINANCE_BANNED_UNTIL = now_ts + 60
-
         print(f"[BINANCE] {msg}")
         return d(_PRICE_CACHE) if _PRICE_CACHE is not None else Decimal("0")
     except (BinanceRequestException, KeyError, TypeError) as e:
@@ -367,22 +336,18 @@ def reconcile_and_notify_starts(ws_trade, ws_log, symbol: str):
         close_str = (row[L_CLOSE - 1] if L_CLOSE and len(row) >= L_CLOSE else "").strip()
         has_close = bool(close_str)
 
-        # Se è già presente un prezzo di chiusura ma non è segnato chiuso -> chiudi
         if has_close and stato in ("", "APERTO"):
             updates.append({"range": gspread.utils.rowcol_to_a1(r, L_STATO), "values": [["CHIUSO"]]})
             stato = "CHIUSO"
 
-        # Se la cella entry NON è vuota e lo stato è vuoto -> APERTO
         if entry_str and stato == "":
             updates.append({"range": gspread.utils.rowcol_to_a1(r, L_STATO), "values": [["APERTO"]]})
             stato = "APERTO"
 
-        # Genera ID se manca su riga APERTA
         if stato == "APERTO" and not trade_id:
             trade_id = gen_trade_id(symbol, r)
             updates.append({"range": gspread.utils.rowcol_to_a1(r, L_ID), "values": [[trade_id]]})
 
-        # START una sola volta
         if stato == "APERTO" and entry > 0 and not start_already_notified(log_msgs, trade_id):
             TP1 = d(row[L_TP1 - 1]) if L_TP1 and len(row) >= L_TP1 and (row[L_TP1 - 1] or "").strip() else TP1_PCT
             TP2 = d(row[L_TP2 - 1]) if L_TP2 and len(row) >= L_TP2 and (row[L_TP2 - 1] or "").strip() else TP2_PCT
@@ -406,10 +371,6 @@ def reconcile_and_notify_starts(ws_trade, ws_log, symbol: str):
 
 # ========== NUOVO: gestione chiusure manuali ==========
 def process_manual_closes(ws_trade, ws_log, H):
-    """
-    Se 'Prezzo chiusura' è valorizzato ma P&L/equity non sono ancora scritti
-    (oppure Stato non è CHIUSO), calcola P&L e chiude la riga.
-    """
     if "prezzo chiusura" not in H:
         return
 
@@ -431,7 +392,6 @@ def process_manual_closes(ws_trade, ws_log, H):
     for r in range(2, len(rows)+1):
         row = rows[r-1]
 
-        # valori raw
         stato = (row[stato_col_idx-1] if len(row) >= stato_col_idx else "").strip().upper()
         entry_str = (row[entry_idx-1] if len(row) >= entry_idx else "").strip()
         close_str = (row[close_idx-1] if len(row) >= close_idx else "").strip()
@@ -439,7 +399,7 @@ def process_manual_closes(ws_trade, ws_log, H):
         plval_str = (row[plval_idx-1] if len(row) >= plval_idx else "").strip()
 
         if not close_str:
-            continue  # niente da fare
+            continue
 
         entry = d(entry_str) if entry_str else Decimal("0")
         close = d(close_str)
@@ -449,7 +409,6 @@ def process_manual_closes(ws_trade, ws_log, H):
         if entry == 0 or close == 0:
             continue
 
-        # se è già CHIUSO ma P&L non scritti, oppure non CHIUSO affatto, calcola
         need_calc = (not plpct_str) or (not plval_str) or (stato != "CHIUSO")
         if not need_calc:
             continue
@@ -458,7 +417,6 @@ def process_manual_closes(ws_trade, ws_log, H):
         eq_prev = last_equity(ws_trade, equity_idx)
         eq_new  = eq_prev + pnl_val
 
-        # prepara aggiornamenti
         if stato != "CHIUSO":
             updates.append({"range": gspread.utils.rowcol_to_a1(r, stato_col_idx), "values": [["CHIUSO"]]})
         updates += [
@@ -523,7 +481,19 @@ def should_log_heartbeat(price: Decimal) -> bool:
         pass
     return False
 
+# --- NUOVO: aggiorna la "foto" globale in K2 (timestamp + prezzo) ---
+def update_global_ping_k2(ws_trade, col_ping: int, price: Decimal):
+    try:
+        ws_trade.update_cell(2, col_ping, f"{now_local_str()} - {fmt_dec(price)}")
+    except Exception as e:
+        print("[DEBUG] update K2 fallito:", e)
+
 def update_open_rows_light(ws_trade, ws_log, client, H, col_ping, lastp=None):
+    """
+    - K2: sempre aggiornato con 'timestamp - prezzo'
+    - Righe APERTE: aggiornano K[riga] con 'timestamp - prezzo' + P&L live
+    - Righe CHIUSE: NON toccate (ping resta congelato)
+    """
     nowloc = now_local_str()
     if lastp is None:
         lastp = get_last_price(client)
@@ -531,26 +501,13 @@ def update_open_rows_light(ws_trade, ws_log, client, H, col_ping, lastp=None):
         log(ws_log, "WARN", "Prezzo 0 da Binance")
         return
 
+    # 1) "Foto" globale in K2
+    update_global_ping_k2(ws_trade, col_ping, lastp)
+
+    # 2) Se non ci sono righe dati, stop qui
     stato_col = ws_trade.col_values(H["stato"])
     if len(stato_col) <= 1:
-        try:
-            ws_trade.update_cell(2, col_ping, f"{nowloc} - {fmt_dec(lastp)}")
-        except Exception as e:
-            log(ws_log, "ERROR", f"[DEBUG] update_cell K2 fallito: {e}")
         return
-
-    n_rows = len(stato_col) - 1
-    start_row = 2
-    end_row = start_row + n_rows - 1
-
-    log(ws_log, "DEBUG", f"Ping @ {fmt_dec(lastp)} - righe={n_rows} - stato_col_len={len(stato_col)}")
-
-    updates = []
-    for r in range(start_row, end_row + 1):
-        updates.append({
-            "range": gspread.utils.rowcol_to_a1(r, col_ping),
-            "values": [[f"{nowloc} - {fmt_dec(lastp)}"]],
-        })
 
     side_col  = ws_trade.col_values(H["lato"]) if "lato" in H else []
     entry_col = ws_trade.col_values(H["prezzo ingresso"])
@@ -565,14 +522,13 @@ def update_open_rows_light(ws_trade, ws_log, client, H, col_ping, lastp=None):
     close_col_idx  = H.get("prezzo chiusura")
     delta_col_idx  = H.get("delta")
 
-    # Debounce: evita di chiudere due volte la stessa riga in questo batch
+    updates = []
     rows_already_closing = set()
-
     global _LAST_MISS_LOG_TS
-
-    # Tolleranza sui trigger in Decimal
     tol = (Decimal(HIT_TOL_BP) / Decimal("10000")) if HIT_TOL_BP > 0 else Decimal("0")
 
+    n_rows = len(stato_col) - 1
+    start_row = 2
     for i in range(n_rows):
         r = start_row + i
         if r in rows_already_closing:
@@ -587,9 +543,18 @@ def update_open_rows_light(ws_trade, ws_log, client, H, col_ping, lastp=None):
         entry = d(entry_str) if entry_str else Decimal("0")
         qty   = d(qty_str) if qty_str else Decimal("1")
 
+        # --- Solo righe APERTE aggiornano il proprio ping ---
+        if stato != "CHIUSO":
+            updates.append({
+                "range": gspread.utils.rowcol_to_a1(r, col_ping),
+                "values": [[f"{nowloc} - {fmt_dec(lastp)}"]],
+            })
+
+        # Se riga CHIUSA o entry mancante, non calcolare P&L live
         if stato == "CHIUSO" or entry == 0:
             continue
 
+        # Trigger TP/SL
         tp1, tp2, sl = compute_targets(entry)
         hit = None
         close_price = None
@@ -626,7 +591,7 @@ def update_open_rows_light(ws_trade, ws_log, client, H, col_ping, lastp=None):
                     f"tp1={fmt_dec(tp1)} tp2={fmt_dec(tp2)} sl={fmt_dec(sl)} qty={fmt_dec(qty,'0.00000001')}")
             continue
 
-        # Segna che questa riga sta chiudendo (debounce)
+        # Debounce
         rows_already_closing.add(r)
 
         # Chiusura per TP/SL
@@ -732,7 +697,6 @@ def ensure_min_open_trades(ws_trade, ws_log, client, H, col_ping,
             log(ws_log, "WARN", "Prezzo 0 da Binance (skip open)")
             return
 
-        # Distanza minima da altri APERTI
         open_entries = []
         entry_col = ws_trade.col_values(H["prezzo ingresso"])
         if len(stato_col) > 1:
@@ -751,7 +715,6 @@ def ensure_min_open_trades(ws_trade, ws_log, client, H, col_ping,
                     f"Skip open: distanza < {MIN_ENTRY_DISTANCE_BP}bp da un entry aperto (last={fmt_dec(lastp)})")
                 return
 
-        # Grid step rispetto all'ultimo aperto
         if GRID_STEP_BP > 0 and _LAST_ENTRY_PRICE:
             move_bp = abs((lastp - _LAST_ENTRY_PRICE) / _LAST_ENTRY_PRICE) * 10000
             if move_bp < GRID_STEP_BP:
@@ -759,7 +722,6 @@ def ensure_min_open_trades(ws_trade, ws_log, client, H, col_ping,
                     f"Skip open: grid step {move_bp:.1f}bp < {GRID_STEP_BP}bp (ultimo={fmt_dec(_LAST_ENTRY_PRICE)} last={fmt_dec(lastp)})")
                 return
 
-        # Apri i mancanti (di fatto passerà 1/giro grazie ai filtri)
         for i in range(to_open):
             trade_id = f"{SYMBOL}-{int(time.time())}-AUTO{i}"
             try:
@@ -787,7 +749,6 @@ def main_loop():
     ws_trade, ws_log = open_sheets()
     client = binance_client()
 
-    # Startup log con versione e parametri principali
     log(ws_log, "INFO",
         f"{BOT_VERSION} - SYMBOL={SYMBOL} - TZ={TIMEZONE} - "
         f"TABS=({ws_trade.title},{ws_log.title}) - "
@@ -803,7 +764,7 @@ def main_loop():
     dump_headers_once(ws_trade, ws_log)
 
     reconcile_and_notify_starts(ws_trade, ws_log, SYMBOL)
-    process_manual_closes(ws_trade, ws_log, _H_CACHE)   # gestisci chiusure manuali subito
+    process_manual_closes(ws_trade, ws_log, _H_CACHE)
     _LAST_RECONCILE_TS = time.time()
 
     if AUTO_OPEN_ON_START:
@@ -816,17 +777,14 @@ def main_loop():
 
     while True:
         try:
-            # Se in ban, pausa gentile e riprova
             if time.time() < _BINANCE_BANNED_UNTIL:
                 ts = datetime.fromtimestamp(_BINANCE_BANNED_UNTIL).strftime('%Y-%m-%d %H:%M:%S')
                 log(ws_log, "WARN", f"Binance bannato fino a {ts}. Sleep {BANNED_FALLBACK_SLEEP}s")
                 time.sleep(BANNED_FALLBACK_SLEEP)
                 continue
 
-            # Una sola lettura prezzo per ciclo (throttlata e con cache)
             lastp = get_last_price(client)
 
-            # Riconcilio periodico + chiusure manuali
             if time.time() - _LAST_RECONCILE_TS >= RECONCILE_MIN_SECONDS:
                 reconcile_and_notify_starts(ws_trade, ws_log, SYMBOL)
                 process_manual_closes(ws_trade, ws_log, _H_CACHE)
